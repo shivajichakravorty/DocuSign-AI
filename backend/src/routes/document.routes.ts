@@ -141,4 +141,217 @@ export async function documentRoutes(
       });
     },
   );
+
+  // 4. GET TABS FOR A DOCUMENT
+  server.get(
+    "/:id/tabs",
+    async (
+      request: FastifyRequest<{ Params: { id: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const { id } = request.params;
+
+      const result = await pool.query(
+        `SELECT t.*, s.full_name as signer_name, s.email as signer_email
+       FROM signature_tabs t
+       LEFT JOIN signers s ON t.signer_id = s.id
+       WHERE t.document_id = $1
+       ORDER BY t.page_number ASC, t.created_at ASC`,
+        [id],
+      );
+
+      return reply.send({ tabs: result.rows });
+    },
+  );
+
+  // 5. SAVE / REPLACE TABS FOR A DOCUMENT
+  server.post(
+    "/:id/tabs",
+    async (
+      request: FastifyRequest<{
+        Params: { id: string };
+        Body: {
+          tabs: Array<{
+            id?: string;
+            signer_id?: string | null;
+            tab_type: string;
+            page_number: number;
+            pos_x: number;
+            pos_y: number;
+            width?: number;
+            height?: number;
+            is_required?: boolean;
+          }>;
+        };
+      }>,
+      reply: FastifyReply,
+    ) => {
+      const { id } = request.params;
+      const { tabs } = request.body || {};
+
+      if (!Array.isArray(tabs)) {
+        return reply
+          .status(400)
+          .send({ error: "Tabs payload must be an array." });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        // Delete existing uncompleted tabs for this document to synchronize state
+        await client.query(
+          "DELETE FROM signature_tabs WHERE document_id = $1 AND value IS NULL",
+          [id],
+        );
+
+        // Bulk insert new tab placements
+        for (const tab of tabs) {
+          await client.query(
+            `INSERT INTO signature_tabs 
+              (document_id, signer_id, tab_type, page_number, pos_x, pos_y, width, height, is_required)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [
+              id,
+              tab.signer_id || null,
+              tab.tab_type,
+              tab.page_number,
+              tab.pos_x,
+              tab.pos_y,
+              tab.width || 130,
+              tab.height || 42,
+              tab.is_required ?? true,
+            ],
+          );
+        }
+
+        await client.query("COMMIT");
+
+        const savedTabs = await client.query(
+          `SELECT t.*, s.full_name as signer_name 
+           FROM signature_tabs t 
+           LEFT JOIN signers s ON t.signer_id = s.id 
+           WHERE t.document_id = $1`,
+          [id],
+        );
+
+        return reply.status(200).send({
+          message: "Tabs synchronized successfully",
+          tabs: savedTabs.rows,
+        });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        server.log.error(err);
+        return reply
+          .status(500)
+          .send({ error: "Failed to synchronize signature tabs." });
+      } finally {
+        client.release();
+      }
+    },
+  );
+
+  // 6. ADD RECIPIENT / SIGNER TO ENVELOPE
+  server.post(
+    "/:id/signers",
+    async (
+      request: FastifyRequest<{
+        Params: { id: string };
+        Body: {
+          email: string;
+          full_name: string;
+          role?: string;
+          signing_order?: number;
+        };
+      }>,
+      reply: FastifyReply,
+    ) => {
+      const { id } = request.params;
+      const {
+        email,
+        full_name,
+        role = "signer",
+        signing_order = 1,
+      } = request.body || {};
+
+      if (!email || !full_name) {
+        return reply
+          .status(400)
+          .send({ error: "Email and full name are required." });
+      }
+
+      // Generate secure 32-byte hexadecimal guest access token
+      const token = crypto.randomBytes(32).toString("hex");
+
+      const result = await pool.query(
+        `INSERT INTO signers (document_id, email, full_name, role, signing_order, token, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+         RETURNING id, document_id, email, full_name, role, signing_order, token, status, created_at`,
+        [id, email, full_name, role, signing_order, token],
+      );
+
+      // Transition document state to 'pending'
+      await pool.query(
+        `UPDATE documents SET status = 'pending' WHERE id = $1 AND status = 'uploaded'`,
+        [id],
+      );
+
+      return reply.status(201).send({
+        message: "Signer added successfully",
+        signer: result.rows[0],
+      });
+    },
+  );
+
+  // 7. PUBLIC SIGNING PORTAL RESOLUTION BY TOKEN
+  server.get(
+    "/sign/:token",
+    async (
+      request: FastifyRequest<{ Params: { token: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const { token } = request.params;
+
+      const signerResult = await pool.query(
+        `SELECT s.*, d.title as document_title, d.file_path, d.status as document_status
+         FROM signers s
+         JOIN documents d ON s.document_id = d.id
+         WHERE s.token = $1`,
+        [token],
+      );
+
+      if (signerResult.rowCount === 0) {
+        return reply
+          .status(404)
+          .send({ error: "Invalid or expired signing link." });
+      }
+
+      const signer = signerResult.rows[0];
+
+      // Fetch tabs assigned specifically to this signer
+      const tabsResult = await pool.query(
+        `SELECT * FROM signature_tabs 
+         WHERE document_id = $1 AND (signer_id = $2 OR signer_id IS NULL)
+         ORDER BY page_number ASC`,
+        [signer.document_id, signer.id],
+      );
+
+      return reply.send({
+        signer: {
+          id: signer.id,
+          email: signer.email,
+          full_name: signer.full_name,
+          role: signer.role,
+          status: signer.status,
+        },
+        document: {
+          id: signer.document_id,
+          title: signer.document_title,
+          file_path: signer.file_path,
+          status: signer.document_status,
+        },
+        tabs: tabsResult.rows,
+      });
+    },
+  );
 }

@@ -9,6 +9,7 @@ import authPlugin from "./plugins/auth.js";
 import { healthRoutes } from "./routes/health.routes.js";
 import { authRoutes } from "./routes/auth.routes.js";
 import { documentRoutes } from "./routes/document.routes.js";
+import { ServerResponse } from "node:http";
 
 const uploadsDir = path.resolve(process.cwd(), "uploads");
 
@@ -29,10 +30,18 @@ async function buildServer() {
   });
 
   // 3. Static Files
+  // Serve uploaded PDFs with explicit CORS access
   await server.register(fastifyStatic, {
     root: uploadsDir,
     prefix: "/uploads/",
     decorateReply: false,
+    setHeaders: (reply) => {
+      reply.header(
+        "Access-Control-Allow-Origin",
+        process.env.CLIENT_ORIGIN || "http://localhost:5173",
+      );
+      reply.header("Access-Control-Allow-Credentials", "true");
+    },
   });
 
   // 4. Auth Plugin

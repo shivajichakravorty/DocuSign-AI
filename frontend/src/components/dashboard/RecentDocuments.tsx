@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   ArrowUpRight,
 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import type { DocumentItem } from "../../types/documents";
 
 interface RecentDocumentsProps {
@@ -17,6 +18,8 @@ export const RecentDocuments: React.FC<RecentDocumentsProps> = ({
   documents,
   loading,
 }) => {
+  const navigate = useNavigate();
+
   return (
     <div className="rounded-2xl bg-slate-900/60 backdrop-blur-xl border border-slate-800/80 p-6 shadow-sm">
       <div className="flex items-center justify-between mb-5">
@@ -43,7 +46,8 @@ export const RecentDocuments: React.FC<RecentDocumentsProps> = ({
           {documents.map((doc) => (
             <div
               key={doc.id}
-              className="py-3.5 flex items-center justify-between group hover:bg-slate-800/30 px-3 -mx-3 rounded-xl transition-colors duration-150"
+              onClick={() => navigate(`/documents/${doc.id}`)}
+              className="py-3.5 flex items-center justify-between group hover:bg-slate-800/30 px-3 -mx-3 rounded-xl transition-colors duration-150 cursor-pointer"
             >
               <div className="flex items-center gap-3.5 min-w-0">
                 <div className="p-2.5 rounded-xl bg-slate-800/70 border border-slate-700/50 text-indigo-400 shrink-0 group-hover:border-indigo-500/30 transition-colors">
@@ -86,6 +90,7 @@ export const RecentDocuments: React.FC<RecentDocumentsProps> = ({
                   href={`http://localhost:3000${doc.file_path}`}
                   target="_blank"
                   rel="noreferrer"
+                  onClick={(e) => e.stopPropagation()}
                   className="p-1.5 rounded-lg text-slate-500 hover:text-indigo-400 hover:bg-slate-800 transition"
                   title="View PDF"
                 >

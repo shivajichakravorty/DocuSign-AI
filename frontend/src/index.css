@@ -1,1 +1,8 @@
 @import "tailwindcss";
+
+.react-pdf__Page__canvas {
+  margin: 0 auto;
+  display: block;
+  max-width: 100%;
+  height: auto !important;
+}
