@@ -14,6 +14,7 @@ import {
   UserCheck,
   Type,
   ShieldAlert,
+  ShieldCheck,
   Save,
   Loader2,
   AlertCircle,
@@ -21,6 +22,9 @@ import {
   UserPlus,
   Copy,
   ExternalLink,
+  Eye,
+  EyeOff,
+  Sparkles,
 } from "lucide-react";
 
 interface Signer {
@@ -30,6 +34,33 @@ interface Signer {
   role: string;
   status: string;
   token?: string;
+}
+
+interface RedactionEntity {
+  id: string;
+  entity_type: string;
+  entity_text: string;
+  confidence: number;
+  page_number: number;
+  pos_x: number;
+  pos_y: number;
+  width: number;
+  height: number;
+  is_masked: boolean;
+}
+
+interface AuditData {
+  compliance_score: number;
+  risk_level: string;
+  flags_count: number;
+  flags_data: Array<{
+    id: string;
+    category: string;
+    severity: string;
+    title: string;
+    description: string;
+    snippet: string | null;
+  }>;
 }
 
 export const DocumentWorkspace: React.FC = () => {
@@ -45,6 +76,12 @@ export const DocumentWorkspace: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+
+  // AI Audit & Redaction State
+  const [auditData, setAuditData] = useState<AuditData | null>(null);
+  const [redactions, setRedactions] = useState<RedactionEntity[]>([]);
+  const [showRedactions, setShowRedactions] = useState(true);
+  const [auditing, setAuditing] = useState(false);
 
   // Recipient Addition State
   const [recipientEmail, setRecipientEmail] = useState("");
@@ -67,14 +104,25 @@ export const DocumentWorkspace: React.FC = () => {
     const fetchWorkspaceData = async () => {
       try {
         setLoading(true);
-        const [docRes, tabsRes] = await Promise.all([
+        const [docRes, tabsRes, auditRes] = await Promise.all([
           apiClient.get(`/documents/${id}`),
           apiClient.get(`/documents/${id}/tabs`),
+          apiClient.get(`/documents/${id}/audit`),
         ]);
         if (isMounted) {
           setDocumentData(docRes.data.document);
           setSigners(docRes.data.signers || []);
           setTabs(tabsRes.data.tabs || []);
+          if (auditRes.data.audit) {
+            setAuditData({
+              ...auditRes.data.audit,
+              flags_data:
+                typeof auditRes.data.audit.flags_data === "string"
+                  ? JSON.parse(auditRes.data.audit.flags_data)
+                  : auditRes.data.audit.flags_data || [],
+            });
+          }
+          setRedactions(auditRes.data.entities || []);
         }
       } catch {
         if (isMounted) {
@@ -96,7 +144,31 @@ export const DocumentWorkspace: React.FC = () => {
     };
   }, [id]);
 
-  // Tab Placement
+  const handleRunAudit = async () => {
+    try {
+      setAuditing(true);
+      setError(null);
+      await apiClient.post(`/documents/${id}/audit`);
+      // Refetch latest audit records and bounding boxes
+      const auditRes = await apiClient.get(`/documents/${id}/audit`);
+      if (auditRes.data.audit) {
+        setAuditData({
+          ...auditRes.data.audit,
+          flags_data:
+            typeof auditRes.data.audit.flags_data === "string"
+              ? JSON.parse(auditRes.data.audit.flags_data)
+              : auditRes.data.audit.flags_data || [],
+        });
+      }
+      setRedactions(auditRes.data.entities || []);
+    } catch {
+      setError("Failed to complete AI security audit.");
+    } finally {
+      setAuditing(false);
+    }
+  };
+
+  // Tab Placement Handlers
   const handlePageClick = (
     pageNumber: number,
     e: React.MouseEvent<HTMLDivElement>,
@@ -147,7 +219,7 @@ export const DocumentWorkspace: React.FC = () => {
     }
   };
 
-  // Dragging Existing Placed Tabs
+  // Dragging Existing Placed Tabs Handlers
   const handleTabMouseDown = (index: number, e: React.MouseEvent) => {
     e.stopPropagation();
     setDraggingTabIdx(index);
@@ -226,16 +298,14 @@ export const DocumentWorkspace: React.FC = () => {
     );
   }
 
-  if (error || !documentData) {
+  if (error && !documentData) {
     return (
       <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center">
         <AlertCircle className="w-10 h-10 text-rose-500 mb-3" />
         <h2 className="text-lg font-bold text-white mb-1">
           Document Load Error
         </h2>
-        <p className="text-sm text-slate-400 mb-4">
-          {error || "Document not found."}
-        </p>
+        <p className="text-sm text-slate-400 mb-4">{error}</p>
         <button
           onClick={() => navigate("/dashboard")}
           className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm transition"
@@ -246,7 +316,7 @@ export const DocumentWorkspace: React.FC = () => {
     );
   }
 
-  const pdfUrl = `http://localhost:3000${documentData.file_path}`;
+  const pdfUrl = `http://localhost:3000${documentData?.file_path}`;
 
   return (
     <div className="h-screen w-screen bg-slate-950 text-slate-100 flex flex-col overflow-hidden font-sans select-none">
@@ -262,10 +332,10 @@ export const DocumentWorkspace: React.FC = () => {
           </button>
           <div>
             <h1 className="text-sm font-bold text-white leading-tight truncate max-w-sm">
-              {documentData.title}
+              {documentData?.title}
             </h1>
             <p className="text-[11px] text-slate-400 truncate">
-              {documentData.original_filename} • {numPages}{" "}
+              {documentData?.original_filename} • {numPages}{" "}
               {numPages === 1 ? "Page" : "Pages"}
             </p>
           </div>
@@ -294,11 +364,33 @@ export const DocumentWorkspace: React.FC = () => {
 
         {/* Save & Status Actions */}
         <div className="flex items-center gap-3">
+          {redactions.length > 0 && (
+            <button
+              onClick={() => setShowRedactions(!showRedactions)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-medium transition ${
+                showRedactions
+                  ? "bg-rose-500/10 border-rose-500/30 text-rose-300"
+                  : "bg-slate-800 border-slate-700 text-slate-300"
+              }`}
+            >
+              {showRedactions ? (
+                <EyeOff className="w-3.5 h-3.5" />
+              ) : (
+                <Eye className="w-3.5 h-3.5" />
+              )}
+              <span>
+                {showRedactions ? "Shield View" : "Plain View"} (
+                {redactions.length})
+              </span>
+            </button>
+          )}
+
           {saveMessage && (
             <span className="text-xs text-emerald-400 font-medium animate-in fade-in">
               {saveMessage}
             </span>
           )}
+
           <button
             onClick={handleSaveTabs}
             disabled={saving}
@@ -396,7 +488,7 @@ export const DocumentWorkspace: React.FC = () => {
           </div>
         </aside>
 
-        {/* Center Stage: Multi-Page Canvas Overlay */}
+        {/* Center Stage: Multi-Page Canvas with Redaction & Tab Overlays */}
         <main
           className="flex-1 bg-slate-950/80 overflow-y-auto p-8 flex flex-col items-center"
           onMouseUp={handlePageMouseUp}
@@ -414,6 +506,9 @@ export const DocumentWorkspace: React.FC = () => {
             {Array.from(new Array(numPages), (_, index) => {
               const pageNumber = index + 1;
               const pageTabs = tabs.filter((t) => t.page_number === pageNumber);
+              const pageRedactions = redactions.filter(
+                (r) => r.page_number === pageNumber,
+              );
 
               return (
                 <div
@@ -433,6 +528,26 @@ export const DocumentWorkspace: React.FC = () => {
                     renderTextLayer={false}
                   />
 
+                  {/* Redaction Entities Bounding-Box Overlay */}
+                  {showRedactions &&
+                    pageRedactions.map((red) => (
+                      <div
+                        key={red.id}
+                        style={{
+                          left: `${red.pos_x}%`,
+                          top: `${red.pos_y}%`,
+                          width: `${red.width}%`,
+                          height: `${red.height}%`,
+                        }}
+                        title={`[${red.entity_type}] ${red.entity_text} (${Math.round(red.confidence * 100)}% conf)`}
+                        className="absolute bg-rose-500/30 border border-rose-500/70 hover:bg-rose-500/50 backdrop-blur-[2px] transition pointer-events-auto rounded-sm group cursor-help z-10"
+                      >
+                        <span className="opacity-0 group-hover:opacity-100 absolute -top-5 left-0 text-[9px] font-mono bg-rose-950/90 text-rose-200 border border-rose-700/60 px-1 py-0.5 rounded shadow pointer-events-none whitespace-nowrap z-30 transition-opacity">
+                          {red.entity_type}
+                        </span>
+                      </div>
+                    ))}
+
                   {/* Render Tabs on Page Canvas */}
                   {pageTabs.map((tab, tabIdx) => {
                     const originalIdx = tabs.indexOf(tab);
@@ -445,7 +560,7 @@ export const DocumentWorkspace: React.FC = () => {
                           left: `${tab.pos_x}%`,
                           top: `${tab.pos_y}%`,
                         }}
-                        className={`absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border shadow-lg cursor-grab active:cursor-grabbing backdrop-blur-md transition-shadow ${
+                        className={`absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border shadow-lg cursor-grab active:cursor-grabbing backdrop-blur-md transition-shadow z-20 ${
                           tab.tab_type === "signature"
                             ? "bg-indigo-950/80 border-indigo-500 text-indigo-300"
                             : tab.tab_type === "initials"
@@ -486,9 +601,97 @@ export const DocumentWorkspace: React.FC = () => {
           </Document>
         </main>
 
-        {/* Right Drawer: Recipients & AI Pre-Audit */}
-        <aside className="w-72 border-l border-slate-800/80 bg-slate-900/30 backdrop-blur-xl p-4 flex flex-col shrink-0 overflow-y-auto">
-          <div className="mb-4">
+        {/* Right Drawer: AI Risk Audit & Signers */}
+        <aside className="w-80 border-l border-slate-800/80 bg-slate-900/30 backdrop-blur-xl p-4 flex flex-col shrink-0 overflow-y-auto space-y-6">
+          {/* Section 1: AI Risk Engine */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                <span>AI Risk Audit</span>
+              </h3>
+              <button
+                onClick={handleRunAudit}
+                disabled={auditing}
+                className="px-2 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/40 text-[10px] font-semibold text-indigo-300 transition disabled:opacity-50"
+              >
+                {auditing
+                  ? "Scanning..."
+                  : auditData
+                    ? "Re-Audit"
+                    : "Run Audit"}
+              </button>
+            </div>
+
+            {auditData ? (
+              <div className="space-y-3">
+                <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-xl flex items-center justify-between">
+                  <div>
+                    <p className="text-[10px] uppercase font-bold text-slate-500">
+                      Compliance Score
+                    </p>
+                    <p className="text-2xl font-black text-white font-mono">
+                      {auditData.compliance_score}
+                      <span className="text-xs text-slate-500">/100</span>
+                    </p>
+                  </div>
+                  <span
+                    className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase border ${
+                      auditData.risk_level === "Low"
+                        ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                        : auditData.risk_level === "Medium"
+                          ? "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                          : "bg-rose-500/10 text-rose-400 border-rose-500/30"
+                    }`}
+                  >
+                    {auditData.risk_level} Risk
+                  </span>
+                </div>
+
+                {auditData.flags_data.length > 0 ? (
+                  <div className="space-y-2">
+                    <p className="text-[11px] font-semibold text-slate-300">
+                      Flagged Clauses ({auditData.flags_data.length})
+                    </p>
+                    {auditData.flags_data.map((flag, idx) => (
+                      <div
+                        key={idx}
+                        className="p-2.5 bg-slate-950/70 border border-amber-500/30 rounded-xl text-xs space-y-1"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-amber-300 truncate max-w-42.5">
+                            {flag.title}
+                          </span>
+                          <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-mono">
+                            {flag.severity}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          {flag.description}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-center gap-2 text-xs text-emerald-300">
+                    <ShieldCheck className="w-4 h-4 shrink-0" />
+                    <span>No critical liability exposure detected.</span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="p-3 bg-slate-950/40 border border-slate-800 rounded-xl text-xs text-slate-400 flex items-start gap-2">
+                <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <span>
+                  Document not audited yet. Click "Run Audit" to scan for PII
+                  and clause risks.
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Section 2: Recipients */}
+          <div>
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
                 Recipients ({signers.length})
@@ -502,7 +705,6 @@ export const DocumentWorkspace: React.FC = () => {
               </button>
             </div>
 
-            {/* Inline Add Signer Form */}
             {showAddRecipient && (
               <form
                 onSubmit={handleAddSigner}
@@ -596,13 +798,6 @@ export const DocumentWorkspace: React.FC = () => {
                 ))}
               </div>
             )}
-          </div>
-
-          <div className="mt-auto p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl flex items-start gap-2.5 text-xs text-amber-300">
-            <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
-            <span>
-              AI Risk Audit: Complete placement before scanning clauses.
-            </span>
           </div>
         </aside>
       </div>

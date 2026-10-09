@@ -354,4 +354,167 @@ export async function documentRoutes(
       });
     },
   );
+  // 8. TRIGGER AI PII SCAN & RISK AUDIT
+  server.post(
+    "/:id/audit",
+    async (
+      request: FastifyRequest<{ Params: { id: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const { id } = request.params;
+
+      // 1. Fetch document record
+      const docResult = await pool.query(
+        "SELECT * FROM documents WHERE id = $1 AND user_id = $2",
+        [id, request.user.id],
+      );
+
+      if (docResult.rows.length === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const document = docResult.rows[0];
+      const absoluteFilePath = path.resolve(
+        process.cwd(),
+        `.${document.file_path}`,
+      );
+
+      if (!fs.existsSync(absoluteFilePath)) {
+        return reply
+          .status(404)
+          .send({ error: "Target PDF file missing from storage." });
+      }
+
+      try {
+        // 2. Dispatch request to Django AI microservice
+        const aiBaseUrl =
+          process.env.AI_SERVICE_URL || "http://127.0.0.1:8000/api";
+        const formData = new FormData();
+        const fileBuffer = await fs.promises.readFile(absoluteFilePath);
+        const blob = new Blob([fileBuffer], { type: "application/pdf" });
+        formData.append("file", blob, document.original_filename);
+
+        const aiResponse = await fetch(`${aiBaseUrl}/scan-document/`, {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!aiResponse.ok) {
+          const errText = await aiResponse.text();
+          server.log.error(`AI Microservice error: ${errText}`);
+          return reply
+            .status(502)
+            .send({ error: "AI processing service error." });
+        }
+
+        const aiData = (await aiResponse.json()) as any;
+        const { audit, pages } = aiData;
+
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+
+          // Clean up any stale audit or redaction entries for this document
+          await client.query(
+            "DELETE FROM redaction_entities WHERE document_id = $1",
+            [id],
+          );
+          await client.query("DELETE FROM audit_logs WHERE document_id = $1", [
+            id,
+          ]);
+
+          // Save Audit Record
+          await client.query(
+            `INSERT INTO audit_logs (document_id, compliance_score, risk_level, flags_count, flags_data)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              id,
+              audit.compliance_score,
+              audit.risk_level,
+              audit.flags_count,
+              JSON.stringify(audit.flags),
+            ],
+          );
+
+          // Batch insert detected spatial PII entities
+          for (const page of pages) {
+            for (const entity of page.entities) {
+              await client.query(
+                `INSERT INTO redaction_entities 
+                  (document_id, entity_type, entity_text, confidence, page_number, pos_x, pos_y, width, height)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                [
+                  id,
+                  entity.type,
+                  entity.text,
+                  entity.confidence,
+                  entity.page_number,
+                  entity.bbox.x_percent,
+                  entity.bbox.y_percent,
+                  entity.bbox.width_percent,
+                  entity.bbox.height_percent,
+                ],
+              );
+            }
+          }
+
+          // Flag document if risk score is low
+          const newStatus =
+            audit.risk_level === "High" ? "flagged" : document.status;
+          await client.query("UPDATE documents SET status = $1 WHERE id = $2", [
+            newStatus,
+            id,
+          ]);
+
+          await client.query("COMMIT");
+
+          return reply.send({
+            message: "Audit completed successfully",
+            audit,
+            total_entities: aiData.total_entities,
+          });
+        } catch (dbErr) {
+          await client.query("ROLLBACK");
+          server.log.error(dbErr);
+          return reply
+            .status(500)
+            .send({ error: "Failed to persist audit scan findings." });
+        } finally {
+          client.release();
+        }
+      } catch (networkErr) {
+        server.log.error(networkErr);
+        return reply
+          .status(503)
+          .send({ error: "AI microservice unreachable." });
+      }
+    },
+  );
+
+  // 9. GET AUDIT FINDINGS AND DETECTED REDACTIONS
+  server.get(
+    "/:id/audit",
+    async (
+      request: FastifyRequest<{ Params: { id: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const { id } = request.params;
+
+      const [auditResult, entitiesResult] = await Promise.all([
+        pool.query(
+          "SELECT * FROM audit_logs WHERE document_id = $1 ORDER BY created_at DESC LIMIT 1",
+          [id],
+        ),
+        pool.query(
+          "SELECT * FROM redaction_entities WHERE document_id = $1 ORDER BY page_number ASC",
+          [id],
+        ),
+      ]);
+
+      return reply.send({
+        audit: auditResult.rows[0] || null,
+        entities: entitiesResult.rows,
+      });
+    },
+  );
 }
