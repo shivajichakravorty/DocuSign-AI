@@ -3,6 +3,9 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
 import pdfplumber
+from rest_framework.views import APIView
+from shield.rag import answer_document_query, ingest_document_chunks
+
 
 from .extractor import extract_pdf_pii, analyzer, anonymizer
 from .auditor import audit_contract_text
@@ -43,6 +46,7 @@ def scan_text_pii(request):
 
 @api_view(['POST'])
 def scan_document_pii(request):
+
     uploaded_file = request.FILES.get("file")
     file_path = request.data.get("file_path")
 
@@ -89,3 +93,101 @@ def scan_document_pii(request):
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+@api_view(['POST'])
+def document_chat(request, document_id):
+    """
+    POST /documents/<document_id>/chat/
+    Body: { "query": "What are the payment terms?" }
+    """
+    query = request.data.get("query")
+    if not query or not query.strip():
+        return Response(
+            {"error": "Query string is required."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        result = answer_document_query(str(document_id), query.strip())
+        return Response(result, status=status.HTTP_200_OK)
+    except Exception as e:
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(['POST'])
+def document_ingest(request, document_id):
+    """
+    POST /documents/<document_id>/ingest/
+    Body: { "file_path": "/path/to/contract.pdf" }
+    """
+    file_path = request.data.get("file_path")
+    if not file_path:
+        return Response(
+            {"error": "file_path is required."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        chunks_count = ingest_document_chunks(str(document_id), file_path)
+        return Response(
+            {"message": "Ingestion successful", "chunks_stored": chunks_count},
+            status=status.HTTP_200_OK
+        )
+    except Exception as e:
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+class DocumentChatView(APIView):
+    """
+    POST /api/documents/<document_id>/chat/
+    Body: { "query": "What are the termination terms?" }
+    """
+    def post(self, request, document_id):
+        query = request.data.get("query")
+        if not query or not query.strip():
+            return Response(
+                {"error": "Query string is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            result = answer_document_query(str(document_id), query.strip())
+            return Response(result, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+
+class DocumentIngestView(APIView):
+    """
+    POST /api/documents/<document_id>/ingest/
+    Body: { "file_path": "/absolute/path/to/contract.pdf" }
+    """
+    def post(self, request, document_id):
+        file_path = request.data.get("file_path")
+        if not file_path:
+            return Response(
+                {"error": "file_path is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            chunks_count = ingest_document_chunks(str(document_id), file_path)
+            return Response(
+                {"message": "Ingestion successful", "chunks_stored": chunks_count},
+                status=status.HTTP_200_OK,
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
