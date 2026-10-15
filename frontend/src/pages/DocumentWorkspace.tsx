@@ -1,10 +1,14 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Document, Page } from "react-pdf";
 import "../utils/pdfWorker";
 import { apiClient } from "../api/client";
-import type { DocumentItem } from "../types/documents";
+import type { DocumentItem as BaseDocumentItem } from "../types/documents";
 import type { SignatureTab, TabType } from "../types/tabs";
+import { AuditProgressTracker } from "../components/AuditProgressTracker";
+import { ClauseRedlineManager } from "../components/ClauseRedlineManager";
+import { AuditCertificateModal } from "../components/AuditCertificateModal";
+
 import {
   ArrowLeft,
   ZoomIn,
@@ -25,7 +29,26 @@ import {
   Eye,
   EyeOff,
   Sparkles,
+  GitPullRequest,
+  Users,
+  CheckCircle2,
+  XCircle,
+  Lock,
+  Fingerprint,
 } from "lucide-react";
+
+interface DocumentItem extends BaseDocumentItem {
+  audit_status?:
+    | "idle"
+    | "queued"
+    | "processing"
+    | "completed"
+    | "failed"
+    | string;
+  audit_job_id?: string | null;
+  risk_score?: number | null;
+  approval_status?: "draft" | "pending_legal" | "approved" | "rejected";
+}
 
 interface Signer {
   id: string;
@@ -76,6 +99,18 @@ export const DocumentWorkspace: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [reloadTrigger, setReloadTrigger] = useState(0);
+
+  // Legal Triage State
+  const [triageLoading, setTriageLoading] = useState(false);
+  const [triageError, setTriageError] = useState<string | null>(null);
+
+  // Right Drawer Tab State ('audit' | 'signers')
+  const [activeRightTab, setActiveRightTab] = useState<"audit" | "signers">(
+    "audit",
+  );
+  const [showRedlineModal, setShowRedlineModal] = useState(false);
+  const [showCertificateModal, setShowCertificateModal] = useState(false);
 
   // AI Audit & Redaction State
   const [auditData, setAuditData] = useState<AuditData | null>(null);
@@ -101,18 +136,21 @@ export const DocumentWorkspace: React.FC = () => {
   useEffect(() => {
     let isMounted = true;
 
-    const fetchWorkspaceData = async () => {
+    async function loadWorkspaceData() {
+      if (!id) return;
       try {
-        setLoading(true);
+        setError(null);
         const [docRes, tabsRes, auditRes] = await Promise.all([
           apiClient.get(`/documents/${id}`),
           apiClient.get(`/documents/${id}/tabs`),
           apiClient.get(`/documents/${id}/audit`),
         ]);
+
         if (isMounted) {
           setDocumentData(docRes.data.document);
           setSigners(docRes.data.signers || []);
           setTabs(tabsRes.data.tabs || []);
+
           if (auditRes.data.audit) {
             setAuditData({
               ...auditRes.data.audit,
@@ -123,48 +161,58 @@ export const DocumentWorkspace: React.FC = () => {
             });
           }
           setRedactions(auditRes.data.entities || []);
+          setLoading(false);
         }
       } catch {
         if (isMounted) {
           setError("Failed to load document workspace.");
-        }
-      } finally {
-        if (isMounted) {
           setLoading(false);
         }
       }
-    };
-
-    if (id) {
-      fetchWorkspaceData();
     }
+
+    void loadWorkspaceData();
 
     return () => {
       isMounted = false;
     };
-  }, [id]);
+  }, [id, reloadTrigger]);
 
+  const refreshWorkspace = useCallback(() => {
+    setReloadTrigger((prev) => prev + 1);
+  }, []);
+
+  // Async Audit Dispatch
   const handleRunAudit = async () => {
     try {
       setAuditing(true);
       setError(null);
       await apiClient.post(`/documents/${id}/audit`);
-      // Refetch latest audit records and bounding boxes
-      const auditRes = await apiClient.get(`/documents/${id}/audit`);
-      if (auditRes.data.audit) {
-        setAuditData({
-          ...auditRes.data.audit,
-          flags_data:
-            typeof auditRes.data.audit.flags_data === "string"
-              ? JSON.parse(auditRes.data.audit.flags_data)
-              : auditRes.data.audit.flags_data || [],
-        });
-      }
-      setRedactions(auditRes.data.entities || []);
+      setDocumentData((prev) =>
+        prev ? { ...prev, audit_status: "processing" } : prev,
+      );
     } catch {
-      setError("Failed to complete AI security audit.");
-    } finally {
+      setError("Failed to enqueue AI security audit.");
       setAuditing(false);
+    }
+  };
+
+  // Legal Approval Triage Handler
+  const handleTriageDecision = async (decision: "approved" | "rejected") => {
+    try {
+      setTriageLoading(true);
+      setTriageError(null);
+      await apiClient.post(`/documents/${id}/triage`, { decision });
+      refreshWorkspace();
+    } catch (err: unknown) {
+      const resp = (
+        err as { response?: { data?: { error?: string; message?: string } } }
+      )?.response?.data;
+      setTriageError(
+        resp?.message || resp?.error || "Failed to record triage decision.",
+      );
+    } finally {
+      setTriageLoading(false);
     }
   };
 
@@ -219,7 +267,6 @@ export const DocumentWorkspace: React.FC = () => {
     }
   };
 
-  // Dragging Existing Placed Tabs Handlers
   const handleTabMouseDown = (index: number, e: React.MouseEvent) => {
     e.stopPropagation();
     setDraggingTabIdx(index);
@@ -260,7 +307,6 @@ export const DocumentWorkspace: React.FC = () => {
     dragStartPos.current = null;
   };
 
-  // Recipient Handlers
   const handleAddSigner = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!recipientEmail || !recipientName) return;
@@ -275,8 +321,11 @@ export const DocumentWorkspace: React.FC = () => {
       setRecipientEmail("");
       setRecipientName("");
       setShowAddRecipient(false);
-    } catch {
-      setError("Failed to add recipient.");
+    } catch (err: unknown) {
+      const resp = (
+        err as { response?: { data?: { error?: string; message?: string } } }
+      )?.response?.data;
+      setError(resp?.message || resp?.error || "Failed to add recipient.");
     } finally {
       setAddingRecipient(false);
     }
@@ -317,6 +366,14 @@ export const DocumentWorkspace: React.FC = () => {
   }
 
   const pdfUrl = `http://localhost:3000${documentData?.file_path}`;
+  const isAuditRunning =
+    auditing ||
+    documentData?.audit_status === "queued" ||
+    documentData?.audit_status === "processing";
+
+  const isApproved = documentData?.approval_status === "approved";
+  const isRejected = documentData?.approval_status === "rejected";
+  const hasHighRiskUnapproved = auditData?.risk_level === "High" && !isApproved;
 
   return (
     <div className="h-screen w-screen bg-slate-950 text-slate-100 flex flex-col overflow-hidden font-sans select-none">
@@ -331,9 +388,24 @@ export const DocumentWorkspace: React.FC = () => {
             <ArrowLeft className="w-5 h-5" />
           </button>
           <div>
-            <h1 className="text-sm font-bold text-white leading-tight truncate max-w-sm">
-              {documentData?.title}
-            </h1>
+            <div className="flex items-center gap-2">
+              <h1 className="text-sm font-bold text-white leading-tight truncate max-w-sm">
+                {documentData?.title}
+              </h1>
+              {documentData?.approval_status && (
+                <span
+                  className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ${
+                    isApproved
+                      ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                      : isRejected
+                        ? "bg-rose-500/10 text-rose-400 border-rose-500/30"
+                        : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                  }`}
+                >
+                  {documentData.approval_status.replace("_", " ")}
+                </span>
+              )}
+            </div>
             <p className="text-[11px] text-slate-400 truncate">
               {documentData?.original_filename} • {numPages}{" "}
               {numPages === 1 ? "Page" : "Pages"}
@@ -364,6 +436,22 @@ export const DocumentWorkspace: React.FC = () => {
 
         {/* Save & Status Actions */}
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowCertificateModal(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 text-xs font-medium transition"
+          >
+            <Fingerprint className="w-3.5 h-3.5" />
+            <span>Audit Seal</span>
+          </button>
+
+          <button
+            onClick={() => setShowRedlineModal(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 text-xs font-medium transition"
+          >
+            <GitPullRequest className="w-3.5 h-3.5" />
+            <span>Clause Redlines</span>
+          </button>
+
           {redactions.length > 0 && (
             <button
               onClick={() => setShowRedactions(!showRedactions)}
@@ -495,7 +583,9 @@ export const DocumentWorkspace: React.FC = () => {
         >
           <Document
             file={{ url: pdfUrl }}
-            onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+            onLoadSuccess={({ numPages: loadedPages }) =>
+              setNumPages(loadedPages)
+            }
             loading={
               <div className="flex items-center gap-2 text-slate-400 py-12">
                 <Loader2 className="w-5 h-5 animate-spin text-indigo-500" />
@@ -602,205 +692,373 @@ export const DocumentWorkspace: React.FC = () => {
         </main>
 
         {/* Right Drawer: AI Risk Audit & Signers */}
-        <aside className="w-80 border-l border-slate-800/80 bg-slate-900/30 backdrop-blur-xl p-4 flex flex-col shrink-0 overflow-y-auto space-y-6">
-          {/* Section 1: AI Risk Engine */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-                <span>AI Risk Audit</span>
-              </h3>
-              <button
-                onClick={handleRunAudit}
-                disabled={auditing}
-                className="px-2 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/40 text-[10px] font-semibold text-indigo-300 transition disabled:opacity-50"
-              >
-                {auditing
-                  ? "Scanning..."
-                  : auditData
-                    ? "Re-Audit"
-                    : "Run Audit"}
-              </button>
-            </div>
+        <aside className="w-88 border-l border-slate-800/80 bg-slate-900/30 backdrop-blur-xl p-4 flex flex-col shrink-0 overflow-y-auto space-y-4">
+          {/* Drawer Tab Switcher */}
+          <div className="grid grid-cols-2 p-1 bg-slate-950/80 border border-slate-800 rounded-xl">
+            <button
+              onClick={() => setActiveRightTab("audit")}
+              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition ${
+                activeRightTab === "audit"
+                  ? "bg-slate-800 text-indigo-300 shadow-sm"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>AI Risk Audit</span>
+            </button>
+            <button
+              onClick={() => setActiveRightTab("signers")}
+              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition ${
+                activeRightTab === "signers"
+                  ? "bg-slate-800 text-indigo-300 shadow-sm"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Users className="w-3.5 h-3.5" />
+              <span>Signers ({signers.length})</span>
+            </button>
+          </div>
 
-            {auditData ? (
-              <div className="space-y-3">
-                <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-xl flex items-center justify-between">
-                  <div>
-                    <p className="text-[10px] uppercase font-bold text-slate-500">
-                      Compliance Score
-                    </p>
-                    <p className="text-2xl font-black text-white font-mono">
-                      {auditData.compliance_score}
-                      <span className="text-xs text-slate-500">/100</span>
-                    </p>
-                  </div>
+          {/* Tab 1: AI Risk Engine & Legal Gatekeeper */}
+          {activeRightTab === "audit" && (
+            <div className="space-y-4">
+              {/* Asynchronous Live WebSocket Tracker */}
+              {isAuditRunning && id && (
+                <div className="p-3 bg-slate-950/80 border border-indigo-500/30 rounded-xl space-y-2">
+                  <p className="text-[11px] font-semibold text-indigo-300">
+                    Live Scan Progress
+                  </p>
+                  <AuditProgressTracker documentId={id} />
+                </div>
+              )}
+
+              {/* Legal Triage & Approval Gate Banner */}
+              <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-950/80 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 flex items-center gap-1.5">
+                    <Lock className="w-3 h-3 text-indigo-400" />
+                    Legal Approval Gate
+                  </span>
                   <span
-                    className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase border ${
-                      auditData.risk_level === "Low"
+                    className={`text-[9px] font-bold uppercase px-2 py-0.5 rounded-full border ${
+                      isApproved
                         ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-                        : auditData.risk_level === "Medium"
-                          ? "bg-amber-500/10 text-amber-400 border-amber-500/30"
-                          : "bg-rose-500/10 text-rose-400 border-rose-500/30"
+                        : isRejected
+                          ? "bg-rose-500/10 text-rose-400 border-rose-500/30"
+                          : "bg-amber-500/10 text-amber-400 border-amber-500/30"
                     }`}
                   >
-                    {auditData.risk_level} Risk
+                    {documentData?.approval_status || "draft"}
                   </span>
                 </div>
 
-                {auditData.flags_data.length > 0 ? (
-                  <div className="space-y-2">
-                    <p className="text-[11px] font-semibold text-slate-300">
-                      Flagged Clauses ({auditData.flags_data.length})
-                    </p>
-                    {auditData.flags_data.map((flag, idx) => (
-                      <div
-                        key={idx}
-                        className="p-2.5 bg-slate-950/70 border border-amber-500/30 rounded-xl text-xs space-y-1"
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="font-semibold text-amber-300 truncate max-w-42.5">
-                            {flag.title}
-                          </span>
-                          <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-mono">
-                            {flag.severity}
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-slate-400">
-                          {flag.description}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-center gap-2 text-xs text-emerald-300">
-                    <ShieldCheck className="w-4 h-4 shrink-0" />
-                    <span>No critical liability exposure detected.</span>
-                  </div>
+                {triageError && (
+                  <p className="text-[11px] text-rose-400 bg-rose-950/40 p-2 rounded-lg border border-rose-900/50">
+                    {triageError}
+                  </p>
                 )}
-              </div>
-            ) : (
-              <div className="p-3 bg-slate-950/40 border border-slate-800 rounded-xl text-xs text-slate-400 flex items-start gap-2">
-                <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                <span>
-                  Document not audited yet. Click "Run Audit" to scan for PII
-                  and clause risks.
-                </span>
-              </div>
-            )}
-          </div>
 
-          {/* Section 2: Recipients */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                Recipients ({signers.length})
-              </h3>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleTriageDecision("approved")}
+                    disabled={triageLoading || isApproved}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-40 transition"
+                  >
+                    {triageLoading ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {isApproved ? "Approved" : "Approve for Signing"}
+                    </span>
+                  </button>
+
+                  <button
+                    onClick={() => handleTriageDecision("rejected")}
+                    disabled={triageLoading || isRejected}
+                    className="py-1.5 px-3 rounded-lg text-xs font-semibold border border-rose-500/40 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 disabled:opacity-40 transition"
+                  >
+                    <XCircle className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                  Risk Overview
+                </span>
+                <button
+                  onClick={handleRunAudit}
+                  disabled={isAuditRunning}
+                  className="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/40 text-[10px] font-semibold text-indigo-300 transition disabled:opacity-50"
+                >
+                  {isAuditRunning
+                    ? "Scanning..."
+                    : auditData
+                      ? "Re-Audit"
+                      : "Run Audit"}
+                </button>
+              </div>
+
+              {auditData ? (
+                <div className="space-y-3">
+                  <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-xl flex items-center justify-between">
+                    <div>
+                      <p className="text-[10px] uppercase font-bold text-slate-500">
+                        Compliance Score
+                      </p>
+                      <p className="text-2xl font-black text-white font-mono">
+                        {auditData.compliance_score}
+                        <span className="text-xs text-slate-500">/100</span>
+                      </p>
+                    </div>
+                    <span
+                      className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase border ${
+                        auditData.risk_level === "Low"
+                          ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                          : auditData.risk_level === "Medium"
+                            ? "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                            : "bg-rose-500/10 text-rose-400 border-rose-500/30"
+                      }`}
+                    >
+                      {auditData.risk_level} Risk
+                    </span>
+                  </div>
+
+                  <button
+                    onClick={() => setShowRedlineModal(true)}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition"
+                  >
+                    <GitPullRequest className="w-3.5 h-3.5" />
+                    <span>Review & Redline Clauses</span>
+                  </button>
+
+                  {auditData.flags_data.length > 0 ? (
+                    <div className="space-y-2">
+                      <p className="text-[11px] font-semibold text-slate-300">
+                        Flagged Clauses ({auditData.flags_data.length})
+                      </p>
+                      {auditData.flags_data.map((flag, idx) => (
+                        <div
+                          key={idx}
+                          className="p-2.5 bg-slate-950/70 border border-amber-500/30 rounded-xl text-xs space-y-1"
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="font-semibold text-amber-300 truncate max-w-42.5">
+                              {flag.title}
+                            </span>
+                            <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-mono">
+                              {flag.severity}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400">
+                            {flag.description}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-center gap-2 text-xs text-emerald-300">
+                      <ShieldCheck className="w-4 h-4 shrink-0" />
+                      <span>No critical liability exposure detected.</span>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="p-3 bg-slate-950/40 border border-slate-800 rounded-xl text-xs text-slate-400 flex items-start gap-2">
+                  <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <span>
+                    Document not audited yet. Click "Run Audit" to scan for PII
+                    and clause risks.
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Tab 2: Recipients */}
+          {activeRightTab === "signers" && (
+            <div className="space-y-4">
+              {/* Approval Gate Warning Banner */}
+              {hasHighRiskUnapproved && (
+                <div className="p-3 bg-amber-950/40 border border-amber-500/40 rounded-xl text-xs text-amber-300 space-y-1">
+                  <p className="font-bold flex items-center gap-1.5">
+                    <Lock className="w-3.5 h-3.5 text-amber-400" />
+                    Approval Gate Active
+                  </p>
+                  <p className="text-[11px] opacity-90">
+                    High Risk clauses must be redlined and approved by Legal
+                    Counsel before signing invites can be dispatched.
+                  </p>
+                </div>
+              )}
+
+              {isRejected && (
+                <div className="p-3 bg-rose-950/40 border border-rose-500/40 rounded-xl text-xs text-rose-300 space-y-1">
+                  <p className="font-bold flex items-center gap-1.5">
+                    <XCircle className="w-3.5 h-3.5 text-rose-400" />
+                    Review Rejected
+                  </p>
+                  <p className="text-[11px] opacity-90">
+                    Legal Counsel rejected this document. Address clause
+                    findings before adding signers.
+                  </p>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                  Manage Signers
+                </span>
+                <button
+                  onClick={() => setShowAddRecipient(!showAddRecipient)}
+                  disabled={hasHighRiskUnapproved || isRejected}
+                  className="p-1 rounded-lg text-indigo-400 hover:text-indigo-300 hover:bg-slate-800 disabled:opacity-40 disabled:hover:bg-transparent transition"
+                  title={
+                    hasHighRiskUnapproved
+                      ? "Legal approval required first"
+                      : "Add Recipient"
+                  }
+                >
+                  <UserPlus className="w-4 h-4" />
+                </button>
+              </div>
+
+              {showAddRecipient && (
+                <form
+                  onSubmit={handleAddSigner}
+                  className="p-3 bg-slate-950/80 border border-indigo-500/30 rounded-xl space-y-2 mb-3"
+                >
+                  <input
+                    type="text"
+                    placeholder="Signer Full Name"
+                    value={recipientName}
+                    onChange={(e) => setRecipientName(e.target.value)}
+                    required
+                    className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:border-indigo-500"
+                  />
+                  <input
+                    type="email"
+                    placeholder="signer@example.com"
+                    value={recipientEmail}
+                    onChange={(e) => setRecipientEmail(e.target.value)}
+                    required
+                    className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:border-indigo-500"
+                  />
+                  <div className="flex justify-end gap-1.5 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowAddRecipient(false)}
+                      className="px-2.5 py-1 text-[11px] text-slate-400 hover:text-white rounded-lg"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={addingRecipient}
+                      className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[11px] font-medium disabled:opacity-50"
+                    >
+                      {addingRecipient ? "Adding..." : "Add"}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {signers.length === 0 ? (
+                <div className="p-3 bg-slate-950/40 border border-slate-800/80 rounded-xl text-xs text-slate-400 text-center">
+                  No signers assigned yet. Click the + button above to add one.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {signers.map((s) => (
+                    <div
+                      key={s.id}
+                      className="p-3 bg-slate-950/60 border border-slate-800 rounded-xl text-xs space-y-2"
+                    >
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <p className="font-semibold text-slate-200 truncate">
+                            {s.full_name}
+                          </p>
+                          <p className="text-[11px] text-slate-400 truncate">
+                            {s.email}
+                          </p>
+                        </div>
+                        <span className="px-2 py-0.5 rounded-full text-[10px] uppercase font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                          {s.status}
+                        </span>
+                      </div>
+
+                      {s.token && (
+                        <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between">
+                          <button
+                            onClick={() => copySigningLink(s.token!)}
+                            className="flex items-center gap-1 text-[11px] text-indigo-400 hover:text-indigo-300"
+                          >
+                            <Copy className="w-3 h-3" />
+                            <span>
+                              {copiedToken === s.token
+                                ? "Copied Link!"
+                                : "Copy Link"}
+                            </span>
+                          </button>
+                          <a
+                            href={`/sign/${s.token}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="p-1 text-slate-400 hover:text-white"
+                            title="Open Portal"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </aside>
+      </div>
+
+      {/* Redline Drawer / Modal Overlay */}
+      {showRedlineModal && id && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+            <div className="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/60">
+              <div className="flex items-center gap-2">
+                <GitPullRequest className="w-5 h-5 text-indigo-400" />
+                <h2 className="text-sm font-bold text-white">
+                  Contract Clause Redlining & AI Remediation
+                </h2>
+              </div>
               <button
-                onClick={() => setShowAddRecipient(!showAddRecipient)}
-                className="p-1 rounded-lg text-indigo-400 hover:text-indigo-300 hover:bg-slate-800 transition"
-                title="Add Recipient"
+                onClick={() => {
+                  setShowRedlineModal(false);
+                  refreshWorkspace();
+                }}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
               >
-                <UserPlus className="w-4 h-4" />
+                <X className="w-5 h-5" />
               </button>
             </div>
 
-            {showAddRecipient && (
-              <form
-                onSubmit={handleAddSigner}
-                className="p-3 bg-slate-950/80 border border-indigo-500/30 rounded-xl space-y-2 mb-3"
-              >
-                <input
-                  type="text"
-                  placeholder="Signer Full Name"
-                  value={recipientName}
-                  onChange={(e) => setRecipientName(e.target.value)}
-                  required
-                  className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:border-indigo-500"
-                />
-                <input
-                  type="email"
-                  placeholder="signer@example.com"
-                  value={recipientEmail}
-                  onChange={(e) => setRecipientEmail(e.target.value)}
-                  required
-                  className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:border-indigo-500"
-                />
-                <div className="flex justify-end gap-1.5 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => setShowAddRecipient(false)}
-                    className="px-2.5 py-1 text-[11px] text-slate-400 hover:text-white rounded-lg"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={addingRecipient}
-                    className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[11px] font-medium disabled:opacity-50"
-                  >
-                    {addingRecipient ? "Adding..." : "Add"}
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {signers.length === 0 ? (
-              <div className="p-3 bg-slate-950/40 border border-slate-800/80 rounded-xl text-xs text-slate-400 text-center">
-                No signers assigned yet. Click the + button above to add one.
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {signers.map((s) => (
-                  <div
-                    key={s.id}
-                    className="p-3 bg-slate-950/60 border border-slate-800 rounded-xl text-xs space-y-2"
-                  >
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <p className="font-semibold text-slate-200 truncate">
-                          {s.full_name}
-                        </p>
-                        <p className="text-[11px] text-slate-400 truncate">
-                          {s.email}
-                        </p>
-                      </div>
-                      <span className="px-2 py-0.5 rounded-full text-[10px] uppercase font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                        {s.status}
-                      </span>
-                    </div>
-
-                    {s.token && (
-                      <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between">
-                        <button
-                          onClick={() => copySigningLink(s.token!)}
-                          className="flex items-center gap-1 text-[11px] text-indigo-400 hover:text-indigo-300"
-                        >
-                          <Copy className="w-3 h-3" />
-                          <span>
-                            {copiedToken === s.token
-                              ? "Copied Link!"
-                              : "Copy Link"}
-                          </span>
-                        </button>
-                        <a
-                          href={`/sign/${s.token}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="p-1 text-slate-400 hover:text-white"
-                          title="Open Portal"
-                        >
-                          <ExternalLink className="w-3 h-3" />
-                        </a>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
+            <div className="p-6 overflow-y-auto flex-1">
+              <ClauseRedlineManager documentId={id} />
+            </div>
           </div>
-        </aside>
-      </div>
+        </div>
+      )}
+
+      {/* Cryptographic Certificate & Tamper Seal Modal */}
+      {showCertificateModal && id && (
+        <AuditCertificateModal
+          documentId={id}
+          onClose={() => setShowCertificateModal(false)}
+        />
+      )}
     </div>
   );
 };

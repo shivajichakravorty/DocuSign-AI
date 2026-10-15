@@ -1,5 +1,11 @@
 from django.urls import path
-from .views import document_ingest, health_check, scan_text_pii, scan_document_pii, document_chat
+from .views import (
+    health_check,
+    scan_text_pii,
+    scan_document_pii,
+    document_chat,
+    document_ingest,
+)
 
 urlpatterns = [
     path('health/', health_check, name='health-check'),

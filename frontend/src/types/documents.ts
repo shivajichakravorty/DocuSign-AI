@@ -1,11 +1,21 @@
 export interface DocumentItem {
   id: string;
-  user_id?: string;
   title: string;
-  original_filename: string;
   file_path: string;
-  file_size_bytes: string | number;
-  status: "uploaded" | "processing" | "pending" | "completed" | "flagged";
-  page_count?: number;
+  original_filename: string;
+  status: string;
   created_at: string;
+  user_id?: string;
+
+  // Phase 1 Async Audit fields
+  audit_status?:
+    | "idle"
+    | "queued"
+    | "processing"
+    | "completed"
+    | "failed"
+    | string;
+  audit_job_id?: string | null;
+  risk_score?: number | null;
+  completed_at?: string | null;
 }

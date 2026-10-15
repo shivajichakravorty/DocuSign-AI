@@ -1,5 +1,14 @@
+import os
 import re
+import json
 from typing import List, Dict, Any
+from django.conf import settings
+from google import genai
+from google.genai import types
+
+# Initialize Gemini API Client
+GEMINI_API_KEY = getattr(settings, "GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 CLAUSE_RULES = [
     {
@@ -54,11 +63,67 @@ CLAUSE_RULES = [
     }
 ]
 
+def generate_ai_remediations(full_text: str, detected_flags: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Uses Gemini to identify verbatim clause boundaries and write balanced redline remediations."""
+    if not detected_flags:
+        return []
+
+    prompt = f"""
+You are an expert contract negotiation attorney.
+The following document triggered specific risk flags:
+{json.dumps([{ 'id': f['id'], 'category': f['category'], 'snippet': f['snippet'] } for f in detected_flags], indent=2)}
+
+For each flagged risk, review the document text:
+1. Locate the exact full clause sentence or paragraph in the text (`original_text`).
+2. Draft a market-standard, balanced fallback replacement clause (`proposed_remediation`) that mitigates the risk while remaining commercially acceptable.
+3. Provide a concise legal rationale (`explanation`).
+
+Return strictly JSON format matching this schema:
+{{
+  "clauses": [
+    {{
+      "id": "<matching rule id>",
+      "category": "<Liability | Indemnification | Intellectual Property | Termination>",
+      "risk_level": "High" | "Medium" | "Low",
+      "original_text": "<verbatim clause excerpt from text>",
+      "proposed_remediation": "<revised balanced substitute text>",
+      "explanation": "<why this was flagged and what the remediation fixes>"
+    }}
+  ]
+}}
+
+Contract Text:
+{full_text[:35000]}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        data = json.loads(response.text)
+        return data.get("clauses", [])
+    except Exception as e:
+        print(f"[Gemini Remediation Error] {e}")
+        # Fallback to standard regex snippets if Gemini call encounters an issue
+        return [
+            {
+                "id": f["id"],
+                "category": f["category"],
+                "risk_level": "High" if f["severity"] == "high" else "Medium",
+                "original_text": f["snippet"] or f["title"],
+                "proposed_remediation": f["snippet"] or f["title"],
+                "explanation": f["description"],
+            }
+            for f in detected_flags
+        ]
+
 def audit_contract_text(full_text: str) -> Dict[str, Any]:
     text_lower = full_text.lower()
-    flags: List[Dict[str, Any]] = []
-    
-    # Base score is 100 (clean)
+    preliminary_flags: List[Dict[str, Any]] = []
     risk_deductions = 0
 
     for rule in CLAUSE_RULES:
@@ -69,24 +134,19 @@ def audit_contract_text(full_text: str) -> Dict[str, Any]:
             match = re.search(pattern, text_lower, re.IGNORECASE)
             if match:
                 matched = True
-                # Extract surrounding context (100 characters before & after)
                 start = max(0, match.start() - 60)
                 end = min(len(full_text), match.end() + 60)
                 matched_snippet = full_text[start:end].strip()
                 break
 
-        # Check if a safe indicator mitigates this flag
         if matched and rule["safe_indicator"]:
             if re.search(rule["safe_indicator"], text_lower, re.IGNORECASE):
-                # Mitigated
                 matched = False
 
         if matched:
             severity = rule["severity"]
-            penalty = 25 if severity == "high" else 15
-            risk_deductions += penalty
-
-            flags.append({
+            risk_deductions += 25 if severity == "high" else 15
+            preliminary_flags.append({
                 "id": rule["id"],
                 "category": rule["category"],
                 "severity": severity,
@@ -95,10 +155,9 @@ def audit_contract_text(full_text: str) -> Dict[str, Any]:
                 "snippet": matched_snippet
             })
 
-    # Liability check: if contract has no liability language at all, add a warning
     has_liability_mention = bool(re.search(r"liability|damages", text_lower))
     if not has_liability_mention and len(full_text.strip()) > 100:
-        flags.append({
+        preliminary_flags.append({
             "id": "missing_limitation_of_liability",
             "category": "Liability",
             "severity": "medium",
@@ -108,11 +167,15 @@ def audit_contract_text(full_text: str) -> Dict[str, Any]:
         })
         risk_deductions += 15
 
+    # Enrich detected issues with Gemini-generated redline remediations
+    enriched_clauses = generate_ai_remediations(full_text, preliminary_flags)
+
     compliance_score = max(0, 100 - risk_deductions)
+    risk_level = "High" if compliance_score < 60 else "Medium" if compliance_score < 85 else "Low"
 
     return {
         "compliance_score": compliance_score,
-        "risk_level": "High" if compliance_score < 60 else "Medium" if compliance_score < 85 else "Low",
-        "flags_count": len(flags),
-        "flags": flags
+        "risk_level": risk_level,
+        "flags_count": len(enriched_clauses),
+        "flags": enriched_clauses
     }

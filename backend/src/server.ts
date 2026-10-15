@@ -2,35 +2,41 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
+import websocket from "@fastify/websocket";
 import path from "node:path";
 import "dotenv/config";
+import { signingRoutes } from "./routes/signing.routes.js";
+
+// Initialize BullMQ worker
+import "./queues/audit.worker.js";
 
 import authPlugin from "./plugins/auth.js";
 import { healthRoutes } from "./routes/health.routes.js";
 import { authRoutes } from "./routes/auth.routes.js";
 import { documentRoutes } from "./routes/document.routes.js";
-import { ServerResponse } from "node:http";
+import { approvalRoutes } from "./routes/approval.routes.js";
 
 const uploadsDir = path.resolve(process.cwd(), "uploads");
-
 const server = Fastify({ logger: true });
 
 async function buildServer() {
-  // 1. CORS
+  // 1. WebSocket Support
+  await server.register(websocket);
+
+  // 2. CORS
   await server.register(cors, {
     origin: process.env.CLIENT_ORIGIN || "http://localhost:5173",
     credentials: true,
   });
 
-  // 2. Multipart Plugin (AWAIT this so content parser is registered before routes)
+  // 3. Multipart Plugin (Registered before routes)
   await server.register(multipart, {
     limits: {
       fileSize: 20 * 1024 * 1024, // 20 MB
     },
   });
 
-  // 3. Static Files
-  // Serve uploaded PDFs with explicit CORS access
+  // 4. Static Files (Uploaded PDFs)
   await server.register(fastifyStatic, {
     root: uploadsDir,
     prefix: "/uploads/",
@@ -44,13 +50,15 @@ async function buildServer() {
     },
   });
 
-  // 4. Auth Plugin
+  // 5. Auth Plugin
   await server.register(authPlugin);
 
-  // 5. Routes
+  // 6. Routes
   await server.register(healthRoutes);
   await server.register(authRoutes, { prefix: "/api/auth" });
   await server.register(documentRoutes, { prefix: "/api/documents" });
+  await server.register(approvalRoutes, { prefix: "/api/documents" });
+  await server.register(signingRoutes, { prefix: "/api/signing" });
 
   return server;
 }

@@ -6,30 +6,69 @@ import {
 } from "fastify";
 import fs from "node:fs";
 import { pipeline } from "node:stream/promises";
-import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import path from "node:path";
 import { pool } from "../db.js";
 import "@fastify/multipart";
-
-import path from "node:path";
+import { auditQueue, redisConnection } from "../queues/audit.queue.js";
 
 const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
 
-// Ensure uploads directory exists on startup
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
+interface IdParam {
+  Params: { id: string };
+}
+
+interface ClausePatchParam {
+  Params: { id: string; clauseId: string };
+  Body: {
+    status: "accepted" | "rejected" | "customized";
+    customText?: string;
+  };
+}
+
+interface SignersPostParam {
+  Params: { id: string };
+  Body: {
+    email: string;
+    full_name: string;
+    role?: string;
+    signing_order?: number;
+  };
+}
+
+interface TabsPostParam {
+  Params: { id: string };
+  Body: {
+    tabs: Array<{
+      id?: string;
+      signer_id?: string | null;
+      tab_type: string;
+      page_number: number;
+      pos_x: number;
+      pos_y: number;
+      width?: number;
+      height?: number;
+      is_required?: boolean;
+    }>;
+  };
+}
+
+interface TokenParam {
+  Params: { token: string };
 }
 
 export async function documentRoutes(
   server: FastifyInstance,
   _opts: FastifyPluginOptions,
 ) {
-  // All routes below require a valid JWT token
-  server.addHook("preHandler", server.authenticate);
-
   // 1. UPLOAD DOCUMENT
   server.post(
     "/upload",
+    { preHandler: [server.authenticate] },
     async (request: FastifyRequest, reply: FastifyReply) => {
       const data = await request.file();
 
@@ -37,7 +76,6 @@ export async function documentRoutes(
         return reply.status(400).send({ error: "No file uploaded." });
       }
 
-      // MIME type validation
       if (data.mimetype !== "application/pdf") {
         return reply
           .status(400)
@@ -50,7 +88,6 @@ export async function documentRoutes(
 
       let bytesWritten = 0;
       try {
-        // Pipe file stream to disk
         await pipeline(
           data.file,
           fs.createWriteStream(savePath).on("data", (chunk) => {
@@ -58,20 +95,17 @@ export async function documentRoutes(
           }),
         );
 
-        // Get exact disk file size
         const stat = await fs.promises.stat(savePath);
 
-        // Extract custom title or fallback to original filename
         const title =
           (data.fields?.title as any)?.value ||
           data.filename.replace(/\.pdf$/i, "");
 
-        // Persist document record in PostgreSQL
         const result = await pool.query(
           `INSERT INTO documents 
-          (user_id, title, original_filename, file_path, file_size_bytes, mime_type, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'uploaded')
-         RETURNING id, title, original_filename, file_path, file_size_bytes, mime_type, status, created_at`,
+            (user_id, title, original_filename, file_path, file_size_bytes, mime_type, status, approval_status)
+           VALUES ($1, $2, $3, $4, $5, $6, 'uploaded', 'draft')
+           RETURNING id, title, original_filename, file_path, file_size_bytes, mime_type, status, approval_status, created_at`,
           [
             request.user.id,
             title,
@@ -87,7 +121,6 @@ export async function documentRoutes(
           document: result.rows[0],
         });
       } catch (err) {
-        // Cleanup orphan file if DB write or streaming failed
         if (fs.existsSync(savePath)) {
           await fs.promises.unlink(savePath);
         }
@@ -100,25 +133,27 @@ export async function documentRoutes(
   );
 
   // 2. GET CURRENT USER'S DOCUMENTS
-  server.get("/", async (request: FastifyRequest, reply: FastifyReply) => {
-    const result = await pool.query(
-      `SELECT id, title, original_filename, file_path, file_size_bytes, status, page_count, created_at 
-       FROM documents 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC`,
-      [request.user.id],
-    );
+  server.get(
+    "/",
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const result = await pool.query(
+        `SELECT id, title, original_filename, file_path, file_size_bytes, status, approval_status, risk_score, audit_status, page_count, created_at 
+         FROM documents 
+         WHERE user_id = $1 
+         ORDER BY created_at DESC`,
+        [request.user.id],
+      );
 
-    return reply.send({ documents: result.rows });
-  });
+      return reply.send({ documents: result.rows });
+    },
+  );
 
   // 3. GET SINGLE DOCUMENT DETAILS
-  server.get(
+  server.get<IdParam>(
     "/:id",
-    async (
-      request: FastifyRequest<{ Params: { id: string } }>,
-      reply: FastifyReply,
-    ) => {
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
       const { id } = request.params;
 
       const docResult = await pool.query(
@@ -143,20 +178,18 @@ export async function documentRoutes(
   );
 
   // 4. GET TABS FOR A DOCUMENT
-  server.get(
+  server.get<IdParam>(
     "/:id/tabs",
-    async (
-      request: FastifyRequest<{ Params: { id: string } }>,
-      reply: FastifyReply,
-    ) => {
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
       const { id } = request.params;
 
       const result = await pool.query(
         `SELECT t.*, s.full_name as signer_name, s.email as signer_email
-       FROM signature_tabs t
-       LEFT JOIN signers s ON t.signer_id = s.id
-       WHERE t.document_id = $1
-       ORDER BY t.page_number ASC, t.created_at ASC`,
+         FROM signature_tabs t
+         LEFT JOIN signers s ON t.signer_id = s.id
+         WHERE t.document_id = $1
+         ORDER BY t.page_number ASC, t.created_at ASC`,
         [id],
       );
 
@@ -165,27 +198,10 @@ export async function documentRoutes(
   );
 
   // 5. SAVE / REPLACE TABS FOR A DOCUMENT
-  server.post(
+  server.post<TabsPostParam>(
     "/:id/tabs",
-    async (
-      request: FastifyRequest<{
-        Params: { id: string };
-        Body: {
-          tabs: Array<{
-            id?: string;
-            signer_id?: string | null;
-            tab_type: string;
-            page_number: number;
-            pos_x: number;
-            pos_y: number;
-            width?: number;
-            height?: number;
-            is_required?: boolean;
-          }>;
-        };
-      }>,
-      reply: FastifyReply,
-    ) => {
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<TabsPostParam>, reply: FastifyReply) => {
       const { id } = request.params;
       const { tabs } = request.body || {};
 
@@ -199,13 +215,11 @@ export async function documentRoutes(
       try {
         await client.query("BEGIN");
 
-        // Delete existing uncompleted tabs for this document to synchronize state
         await client.query(
           "DELETE FROM signature_tabs WHERE document_id = $1 AND value IS NULL",
           [id],
         );
 
-        // Bulk insert new tab placements
         for (const tab of tabs) {
           await client.query(
             `INSERT INTO signature_tabs 
@@ -251,21 +265,11 @@ export async function documentRoutes(
     },
   );
 
-  // 6. ADD RECIPIENT / SIGNER TO ENVELOPE
-  server.post(
+  // 6. ADD RECIPIENT / SIGNER TO ENVELOPE (PROTECTED BY LEGAL APPROVAL GATE)
+  server.post<SignersPostParam>(
     "/:id/signers",
-    async (
-      request: FastifyRequest<{
-        Params: { id: string };
-        Body: {
-          email: string;
-          full_name: string;
-          role?: string;
-          signing_order?: number;
-        };
-      }>,
-      reply: FastifyReply,
-    ) => {
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<SignersPostParam>, reply: FastifyReply) => {
       const { id } = request.params;
       const {
         email,
@@ -280,7 +284,45 @@ export async function documentRoutes(
           .send({ error: "Email and full name are required." });
       }
 
-      // Generate secure 32-byte hexadecimal guest access token
+      const docRes = await pool.query(
+        `SELECT id, approval_status, risk_score 
+         FROM documents 
+         WHERE id = $1 AND user_id = $2`,
+        [id, request.user.id],
+      );
+
+      if (docRes.rowCount === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const document = docRes.rows[0];
+
+      if (document.approval_status === "rejected") {
+        return reply.status(403).send({
+          error: "Signing Release Blocked",
+          message:
+            "This document was rejected during legal review. You cannot add recipients until issues are remediated.",
+        });
+      }
+
+      const unresolvedRisks = await pool.query(
+        `SELECT COUNT(*)::int AS count 
+         FROM document_clauses 
+         WHERE document_id = $1 
+           AND risk_level = 'High' 
+           AND status = 'pending'`,
+        [id],
+      );
+
+      const highRiskCount = unresolvedRisks.rows[0].count;
+
+      if (highRiskCount > 0 && document.approval_status !== "approved") {
+        return reply.status(403).send({
+          error: "Signing Release Blocked",
+          message: `This document has ${highRiskCount} unmitigated High Risk clause(s). A Legal Counsel or Admin must approve redlines before signers can be added.`,
+        });
+      }
+
       const token = crypto.randomBytes(32).toString("hex");
 
       const result = await pool.query(
@@ -290,7 +332,6 @@ export async function documentRoutes(
         [id, email, full_name, role, signing_order, token],
       );
 
-      // Transition document state to 'pending'
       await pool.query(
         `UPDATE documents SET status = 'pending' WHERE id = $1 AND status = 'uploaded'`,
         [id],
@@ -304,16 +345,13 @@ export async function documentRoutes(
   );
 
   // 7. PUBLIC SIGNING PORTAL RESOLUTION BY TOKEN
-  server.get(
+  server.get<TokenParam>(
     "/sign/:token",
-    async (
-      request: FastifyRequest<{ Params: { token: string } }>,
-      reply: FastifyReply,
-    ) => {
+    async (request: FastifyRequest<TokenParam>, reply: FastifyReply) => {
       const { token } = request.params;
 
       const signerResult = await pool.query(
-        `SELECT s.*, d.title as document_title, d.file_path, d.status as document_status
+        `SELECT s.*, d.title as document_title, d.file_path, d.status as document_status, d.approval_status
          FROM signers s
          JOIN documents d ON s.document_id = d.id
          WHERE s.token = $1`,
@@ -328,7 +366,14 @@ export async function documentRoutes(
 
       const signer = signerResult.rows[0];
 
-      // Fetch tabs assigned specifically to this signer
+      if (signer.approval_status === "rejected") {
+        return reply.status(403).send({
+          error: "Document Unavailable",
+          message:
+            "This agreement has been placed on hold or rejected by legal counsel.",
+        });
+      }
+
       const tabsResult = await pool.query(
         `SELECT * FROM signature_tabs 
          WHERE document_id = $1 AND (signer_id = $2 OR signer_id IS NULL)
@@ -349,21 +394,20 @@ export async function documentRoutes(
           title: signer.document_title,
           file_path: signer.file_path,
           status: signer.document_status,
+          approval_status: signer.approval_status,
         },
         tabs: tabsResult.rows,
       });
     },
   );
-  // 8. TRIGGER AI PII SCAN & RISK AUDIT
-  server.post(
+
+  // 8. TRIGGER AI PII SCAN & RISK AUDIT (ASYNC via BullMQ)
+  server.post<IdParam>(
     "/:id/audit",
-    async (
-      request: FastifyRequest<{ Params: { id: string } }>,
-      reply: FastifyReply,
-    ) => {
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
       const { id } = request.params;
 
-      // 1. Fetch document record
       const docResult = await pool.query(
         "SELECT * FROM documents WHERE id = $1 AND user_id = $2",
         [id, request.user.id],
@@ -374,130 +418,42 @@ export async function documentRoutes(
       }
 
       const document = docResult.rows[0];
-      const absoluteFilePath = path.resolve(
-        process.cwd(),
-        `.${document.file_path}`,
+
+      const job = await auditQueue.add(
+        "document-audit",
+        {
+          documentId: document.id,
+          userId: request.user.id,
+          filePath: document.file_path,
+          originalFilename: document.original_filename,
+        },
+        {
+          removeOnComplete: 100,
+          removeOnFail: 500,
+        },
       );
 
-      if (!fs.existsSync(absoluteFilePath)) {
-        return reply
-          .status(404)
-          .send({ error: "Target PDF file missing from storage." });
-      }
+      await pool.query(
+        `UPDATE documents 
+         SET audit_status = 'queued', audit_job_id = $1 
+         WHERE id = $2`,
+        [job.id, id],
+      );
 
-      try {
-        // 2. Dispatch request to Django AI microservice
-        const aiBaseUrl =
-          process.env.AI_SERVICE_URL || "http://127.0.0.1:8000/api";
-        const formData = new FormData();
-        const fileBuffer = await fs.promises.readFile(absoluteFilePath);
-        const blob = new Blob([fileBuffer], { type: "application/pdf" });
-        formData.append("file", blob, document.original_filename);
-
-        const aiResponse = await fetch(`${aiBaseUrl}/scan-document/`, {
-          method: "POST",
-          body: formData,
-        });
-
-        if (!aiResponse.ok) {
-          const errText = await aiResponse.text();
-          server.log.error(`AI Microservice error: ${errText}`);
-          return reply
-            .status(502)
-            .send({ error: "AI processing service error." });
-        }
-
-        const aiData = (await aiResponse.json()) as any;
-        const { audit, pages } = aiData;
-
-        const client = await pool.connect();
-        try {
-          await client.query("BEGIN");
-
-          // Clean up any stale audit or redaction entries for this document
-          await client.query(
-            "DELETE FROM redaction_entities WHERE document_id = $1",
-            [id],
-          );
-          await client.query("DELETE FROM audit_logs WHERE document_id = $1", [
-            id,
-          ]);
-
-          // Save Audit Record
-          await client.query(
-            `INSERT INTO audit_logs (document_id, compliance_score, risk_level, flags_count, flags_data)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [
-              id,
-              audit.compliance_score,
-              audit.risk_level,
-              audit.flags_count,
-              JSON.stringify(audit.flags),
-            ],
-          );
-
-          // Batch insert detected spatial PII entities
-          for (const page of pages) {
-            for (const entity of page.entities) {
-              await client.query(
-                `INSERT INTO redaction_entities 
-                  (document_id, entity_type, entity_text, confidence, page_number, pos_x, pos_y, width, height)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                [
-                  id,
-                  entity.type,
-                  entity.text,
-                  entity.confidence,
-                  entity.page_number,
-                  entity.bbox.x_percent,
-                  entity.bbox.y_percent,
-                  entity.bbox.width_percent,
-                  entity.bbox.height_percent,
-                ],
-              );
-            }
-          }
-
-          // Flag document if risk score is low
-          const newStatus =
-            audit.risk_level === "High" ? "flagged" : document.status;
-          await client.query("UPDATE documents SET status = $1 WHERE id = $2", [
-            newStatus,
-            id,
-          ]);
-
-          await client.query("COMMIT");
-
-          return reply.send({
-            message: "Audit completed successfully",
-            audit,
-            total_entities: aiData.total_entities,
-          });
-        } catch (dbErr) {
-          await client.query("ROLLBACK");
-          server.log.error(dbErr);
-          return reply
-            .status(500)
-            .send({ error: "Failed to persist audit scan findings." });
-        } finally {
-          client.release();
-        }
-      } catch (networkErr) {
-        server.log.error(networkErr);
-        return reply
-          .status(503)
-          .send({ error: "AI microservice unreachable." });
-      }
+      return reply.status(202).send({
+        message: "Audit job queued successfully.",
+        documentId: id,
+        jobId: job.id,
+        status: "queued",
+      });
     },
   );
 
   // 9. GET AUDIT FINDINGS AND DETECTED REDACTIONS
-  server.get(
+  server.get<IdParam>(
     "/:id/audit",
-    async (
-      request: FastifyRequest<{ Params: { id: string } }>,
-      reply: FastifyReply,
-    ) => {
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
       const { id } = request.params;
 
       const [auditResult, entitiesResult] = await Promise.all([
@@ -514,6 +470,127 @@ export async function documentRoutes(
       return reply.send({
         audit: auditResult.rows[0] || null,
         entities: entitiesResult.rows,
+      });
+    },
+  );
+
+  // 10. REAL-TIME AUDIT PROGRESS WEBSOCKET
+  server.get<IdParam>(
+    "/:id/audit/stream",
+    { websocket: true },
+    async (socket, req: FastifyRequest<IdParam>) => {
+      const { id } = req.params;
+      const subRedis = redisConnection.duplicate();
+
+      await subRedis.subscribe(`audit-progress:${id}`);
+
+      subRedis.on("message", (_channel, message) => {
+        socket.send(message);
+      });
+
+      socket.on("close", async () => {
+        await subRedis.unsubscribe(`audit-progress:${id}`);
+        subRedis.quit();
+      });
+    },
+  );
+
+  // 11. GET DOCUMENT CLAUSES & REDLINE STATE
+  server.get<IdParam>(
+    "/:id/clauses",
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
+      const { id } = request.params;
+
+      const docCheck = await pool.query(
+        "SELECT id FROM documents WHERE id = $1 AND user_id = $2",
+        [id, request.user.id],
+      );
+
+      if (docCheck.rowCount === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const result = await pool.query(
+        `SELECT id, document_id, category, risk_level, original_text, 
+                proposed_remediation, current_text, status, explanation, created_at, updated_at
+         FROM document_clauses 
+         WHERE document_id = $1 
+         ORDER BY 
+           CASE risk_level 
+             WHEN 'High' THEN 1 
+             WHEN 'Medium' THEN 2 
+             WHEN 'Low' THEN 3 
+             ELSE 4 
+           END, 
+           created_at ASC`,
+        [id],
+      );
+
+      return reply.send({ clauses: result.rows });
+    },
+  );
+
+  // 12. UPDATE CLAUSE REMEDIATION STATUS (Accept, Reject, Customize)
+  server.patch<ClausePatchParam>(
+    "/:id/clauses/:clauseId",
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<ClausePatchParam>, reply: FastifyReply) => {
+      const { id, clauseId } = request.params;
+      const { status: newStatus, customText } = request.body || {};
+
+      if (!["accepted", "rejected", "customized"].includes(newStatus)) {
+        return reply.status(400).send({
+          error:
+            "Invalid status. Must be 'accepted', 'rejected', or 'customized'.",
+        });
+      }
+
+      const docCheck = await pool.query(
+        "SELECT id FROM documents WHERE id = $1 AND user_id = $2",
+        [id, request.user.id],
+      );
+
+      if (docCheck.rowCount === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const clauseResult = await pool.query(
+        "SELECT * FROM document_clauses WHERE id = $1 AND document_id = $2",
+        [clauseId, id],
+      );
+
+      if (clauseResult.rowCount === 0) {
+        return reply.status(404).send({ error: "Clause not found." });
+      }
+
+      const clause = clauseResult.rows[0];
+      let updatedText = clause.current_text;
+
+      if (newStatus === "accepted") {
+        updatedText = clause.proposed_remediation;
+      } else if (newStatus === "rejected") {
+        updatedText = clause.original_text;
+      } else if (newStatus === "customized") {
+        if (!customText || !customText.trim()) {
+          return reply.status(400).send({
+            error: "customText must be provided when status is 'customized'.",
+          });
+        }
+        updatedText = customText.trim();
+      }
+
+      const updateResult = await pool.query(
+        `UPDATE document_clauses 
+         SET status = $1, current_text = $2, updated_at = NOW() 
+         WHERE id = $3 AND document_id = $4 
+         RETURNING *`,
+        [newStatus, updatedText, clauseId, id],
+      );
+
+      return reply.send({
+        message: `Clause successfully updated to '${newStatus}'.`,
+        clause: updateResult.rows[0],
       });
     },
   );
