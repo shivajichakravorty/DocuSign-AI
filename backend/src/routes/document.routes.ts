@@ -594,4 +594,120 @@ export async function documentRoutes(
       });
     },
   );
+
+  // 13. EXPORT HARDENED PDF (REDACTED OR SIGNED + CERTIFIED)
+  server.get<{
+    Params: { id: string };
+    Querystring: { type?: "redacted" | "signed" };
+  }>(
+    "/:id/export",
+    { preHandler: [server.authenticate] },
+    async (request, reply) => {
+      const { id } = request.params;
+      const exportType =
+        request.query.type === "redacted" ? "redacted" : "signed";
+
+      // 1. Verify document ownership
+      const docResult = await pool.query(
+        "SELECT * FROM documents WHERE id = $1 AND user_id = $2",
+        [id, request.user.id],
+      );
+
+      if (docResult.rows.length === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const document = docResult.rows[0];
+      const absoluteFilePath = path.resolve(
+        process.cwd(),
+        `.${document.file_path}`,
+      );
+
+      if (!fs.existsSync(absoluteFilePath)) {
+        return reply
+          .status(404)
+          .send({ error: "Source PDF missing from storage." });
+      }
+
+      try {
+        // 2. Fetch redactions, tabs, signers, and latest audit log
+        const [redactionsRes, tabsRes, signersRes, auditRes] =
+          await Promise.all([
+            pool.query(
+              "SELECT * FROM redaction_entities WHERE document_id = $1 AND is_masked = TRUE",
+              [id],
+            ),
+            pool.query("SELECT * FROM signature_tabs WHERE document_id = $1", [
+              id,
+            ]),
+            pool.query(
+              "SELECT full_name, email, status, signed_at FROM signers WHERE document_id = $1 ORDER BY signing_order ASC",
+              [id],
+            ),
+            pool.query(
+              "SELECT compliance_score, risk_level FROM audit_logs WHERE document_id = $1 ORDER BY created_at DESC LIMIT 1",
+              [id],
+            ),
+          ]);
+
+        const formData = new FormData();
+        const fileBuffer = await fs.promises.readFile(absoluteFilePath);
+        formData.append(
+          "file",
+          new Blob([fileBuffer], { type: "application/pdf" }),
+          document.original_filename,
+        );
+        formData.append("redactions", JSON.stringify(redactionsRes.rows));
+
+        // Only burn tabs & append certificate on 'signed' export
+        if (exportType === "signed") {
+          formData.append("tabs", JSON.stringify(tabsRes.rows));
+          const latestAudit = auditRes.rows[0];
+          formData.append(
+            "certificate_data",
+            JSON.stringify({
+              title: document.title,
+              document_id: document.id,
+              compliance_score: latestAudit?.compliance_score ?? "N/A",
+              risk_level: latestAudit?.risk_level ?? "Unscanned",
+              signers: signersRes.rows,
+            }),
+          );
+        } else {
+          formData.append("tabs", "[]");
+        }
+
+        const aiBaseUrl =
+          process.env.AI_SERVICE_URL || "http://127.0.0.1:8000/api";
+        const aiResponse = await fetch(`${aiBaseUrl}/flatten-document/`, {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!aiResponse.ok) {
+          const errText = await aiResponse.text();
+          server.log.error(`Flatten error: ${errText}`);
+          return reply
+            .status(502)
+            .send({ error: "Failed to generate hardened PDF." });
+        }
+
+        const pdfArrayBuffer = await aiResponse.arrayBuffer();
+        const outputFilename = `${exportType}_${document.original_filename}`;
+
+        return reply
+          .header("Content-Type", "application/pdf")
+          .header(
+            "Content-Disposition",
+            `attachment; filename="${outputFilename}"`,
+          )
+          .send(Buffer.from(pdfArrayBuffer));
+      } catch (err) {
+        server.log.error(err);
+        return reply
+          .status(500)
+          .send({ error: "Internal error exporting PDF." });
+      }
+    },
+  );
 }

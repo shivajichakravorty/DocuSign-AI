@@ -7,6 +7,10 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.views import APIView
+from django.http import FileResponse
+from .flattener import flatten_and_certify_pdf
+import uuid
+from .extractor import extract_pdf_pii, analyzer, anonymizer
 
 from shield.rag import answer_document_query, ingest_document_chunks
 from .extractor import extract_pdf_pii, analyzer, anonymizer
@@ -182,6 +186,61 @@ def document_ingest(request, document_id):
             {"error": str(e)},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+@api_view(['POST'])
+def flatten_document_view(request):
+    """
+    Accepts multipart 'file' plus JSON strings for 'redactions', 'tabs', and 'certificate_data'.
+    Returns the hardened, flattened PDF binary with SHA-256 headers.
+    """
+    uploaded_file = request.FILES.get("file")
+    if not uploaded_file:
+        return Response({"error": "PDF 'file' is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        redactions = json.loads(request.data.get("redactions", "[]"))
+        tabs = json.loads(request.data.get("tabs", "[]"))
+        cert_raw = request.data.get("certificate_data")
+        certificate_data = json.loads(cert_raw) if cert_raw else None
+    except json.JSONDecodeError:
+        return Response({"error": "Invalid JSON metadata payload."}, status=status.HTTP_400_BAD_REQUEST)
+
+    job_id = str(uuid.uuid4())
+    in_path = f"/tmp/{job_id}_in.pdf"
+    out_path = f"/tmp/{job_id}_out.pdf"
+
+    try:
+        with open(in_path, "wb+") as dest:
+            for chunk in uploaded_file.chunks():
+                dest.write(chunk)
+
+        hashes = flatten_and_certify_pdf(
+            input_path=in_path,
+            output_path=out_path,
+            redactions=redactions,
+            tabs=tabs,
+            certificate_data=certificate_data,
+        )
+
+        # Read output into memory so temp files can be cleaned up safely
+        with open(out_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        from django.http import HttpResponse
+        response = HttpResponse(pdf_bytes, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="shielded_{uploaded_file.name}"'
+        response["X-Original-SHA256"] = hashes["original_sha256"]
+        response["X-Final-SHA256"] = hashes["final_sha256"]
+        return response
+
+    except Exception as e:
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    finally:
+        for p in (in_path, out_path):
+            if os.path.exists(p):
+                os.remove(p)
+
 
 
 class DocumentChatView(APIView):

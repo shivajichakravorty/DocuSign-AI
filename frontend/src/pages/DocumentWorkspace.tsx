@@ -35,6 +35,7 @@ import {
   XCircle,
   Lock,
   Fingerprint,
+  Download,
 } from "lucide-react";
 
 interface DocumentItem extends BaseDocumentItem {
@@ -100,6 +101,11 @@ export const DocumentWorkspace: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [reloadTrigger, setReloadTrigger] = useState(0);
+
+  // Export State
+  const [exportingType, setExportingType] = useState<
+    "redacted" | "signed" | null
+  >(null);
 
   // Legal Triage State
   const [triageLoading, setTriageLoading] = useState(false);
@@ -181,6 +187,39 @@ export const DocumentWorkspace: React.FC = () => {
   const refreshWorkspace = useCallback(() => {
     setReloadTrigger((prev) => prev + 1);
   }, []);
+
+  // Hardened PDF Flattening & Export Handler
+  const handleExportPdf = async (type: "redacted" | "signed") => {
+    if (!id) return;
+    try {
+      setExportingType(type);
+      const response = await apiClient.get(
+        `/documents/${id}/export?type=${type}`,
+        {
+          responseType: "blob",
+        },
+      );
+
+      const blobUrl = window.URL.createObjectURL(
+        new Blob([response.data], { type: "application/pdf" }),
+      );
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.setAttribute(
+        "download",
+        `${type}_${documentData?.original_filename || "document.pdf"}`,
+      );
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      console.error("Export failed:", err);
+      setError("Failed to generate hardened PDF export.");
+    } finally {
+      setExportingType(null);
+    }
+  };
 
   // Async Audit Dispatch
   const handleRunAudit = async () => {
@@ -434,8 +473,36 @@ export const DocumentWorkspace: React.FC = () => {
           </button>
         </div>
 
-        {/* Save & Status Actions */}
-        <div className="flex items-center gap-3">
+        {/* Save, Export & Status Actions */}
+        <div className="flex items-center gap-2.5">
+          <button
+            onClick={() => handleExportPdf("redacted")}
+            disabled={exportingType !== null}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-700 bg-slate-800/80 hover:bg-slate-800 text-slate-200 text-xs font-medium transition disabled:opacity-50"
+            title="Download PDF with scrubbed PII redactions"
+          >
+            {exportingType === "redacted" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+            ) : (
+              <Download className="w-3.5 h-3.5 text-amber-400" />
+            )}
+            <span>Redacted PDF</span>
+          </button>
+
+          <button
+            onClick={() => handleExportPdf("signed")}
+            disabled={exportingType !== null}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 text-xs font-medium transition disabled:opacity-50"
+            title="Download flattened PDF with burned signatures & Certificate of Completion"
+          >
+            {exportingType === "signed" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+            ) : (
+              <Download className="w-3.5 h-3.5 text-emerald-400" />
+            )}
+            <span>Executed PDF</span>
+          </button>
+
           <button
             onClick={() => setShowCertificateModal(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 text-xs font-medium transition"
