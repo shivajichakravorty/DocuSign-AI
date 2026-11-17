@@ -93,3 +93,11 @@ Python 3.11+
 PostgreSQL 14+
 
 Redis (for BullMQ background audit jobs)
+
+🗺️ Roadmap
+[x] Phase 1: JWT authentication, session persistence, and glassmorphic dashboard UI
+[x] Phase 2: Streaming PDF uploads, multi-page viewer, draggable signature tabs, and tokenized guest signing
+[x] Phase 3: Django AI service with Presidio spatial PII redaction, clause risk auditing, and live WebSocket progress
+[x] Phase 4A: Legal approval gatekeeper, clause redlining, SHA-256 tamper-sealing, and hardened PyMuPDF binary PDF/certificate export
+[ ] Phase 4B: Privacy-preserving Document Chat (pgvector hybrid search + reversible surrogate token masking)
+[ ] Phase 5: Automated test suite (Pytest / Playwright), S3/R2 object storage, and Docker Compose deployment
