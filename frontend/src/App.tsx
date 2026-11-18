@@ -7,6 +7,8 @@ import { Dashboard } from "./pages/Dashboard";
 import { DocumentWorkspace } from "./pages/DocumentWorkspace";
 import { PublicSigningPortal } from "./pages/PublicSigningPortal";
 import { ProtectedRoute } from "./components/ProtectedRoute";
+import { ForgotPassword } from "./pages/ForgotPassword";
+import { ResetPassword } from "./pages/ResetPassword";
 
 export const App: React.FC = () => {
   return (
@@ -16,6 +18,8 @@ export const App: React.FC = () => {
           {/* Public Routes */}
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+          <Route path="/reset-password" element={<ResetPassword />} />
           <Route path="/sign/:token" element={<PublicSigningPortal />} />
 
           {/* Protected Routes */}

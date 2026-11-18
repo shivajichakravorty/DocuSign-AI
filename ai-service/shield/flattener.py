@@ -1,5 +1,5 @@
 import hashlib
-import fitz  # PyMuPDF
+import fitz # PyMuPDF
 from datetime import datetime, timezone
 
 

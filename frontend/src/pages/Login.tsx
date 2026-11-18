@@ -53,7 +53,7 @@ export const Login: React.FC = () => {
       {/* Main Card Container */}
       <div className="relative w-full max-w-md group">
         {/* Subtle glowing card border on hover */}
-        <div className="absolute -inset-0.5 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-2xl blur opacity-30 group-hover:opacity-75 transition duration-500 group-hover:duration-200" />
+        <div className="absolute -inset-0.5 bg-linear-to-r from-indigo-500 to-purple-600 rounded-2xl blur opacity-30 group-hover:opacity-75 transition duration-500 group-hover:duration-200" />
 
         <div className="relative bg-slate-900/90 backdrop-blur-xl border border-slate-800/80 rounded-2xl p-8 shadow-2xl transition-all duration-300">
           {/* Logo & Header */}
@@ -103,6 +103,12 @@ export const Login: React.FC = () => {
                 <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
                   Password
                 </label>
+                <Link
+                  to="/forgot-password"
+                  className="text-xs font-medium text-indigo-400 hover:text-indigo-300 transition-colors duration-150"
+                >
+                  Forgot password?
+                </Link>
               </div>
               <div className="relative">
                 <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
@@ -122,7 +128,7 @@ export const Login: React.FC = () => {
             <button
               type="submit"
               disabled={isSubmitting}
-              className="w-full relative flex items-center justify-center gap-2 py-3 px-4 bg-gradient-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white font-medium text-sm rounded-xl shadow-lg shadow-indigo-500/20 hover:shadow-indigo-500/35 transition-all duration-200 transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 disabled:pointer-events-none disabled:transform-none"
+              className="w-full relative flex items-center justify-center gap-2 py-3 px-4 bg-linear-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white font-medium text-sm rounded-xl shadow-lg shadow-indigo-500/20 hover:shadow-indigo-500/35 transition-all duration-200 transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 disabled:pointer-events-none disabled:transform-none"
             >
               {isSubmitting ? (
                 <>
