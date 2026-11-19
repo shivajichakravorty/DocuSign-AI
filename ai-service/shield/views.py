@@ -241,6 +241,65 @@ def flatten_document_view(request):
             if os.path.exists(p):
                 os.remove(p)
 
+@api_view(['POST'])
+def document_ingest(request, document_id):
+    """
+    Accepts either an uploaded multipart 'file' or a local 'file_path',
+    sanitizes PII into surrogate tokens, embeds chunks locally via FastEmbed,
+    and stores vectors + surrogate lookup map in PostgreSQL.
+    """
+    uploaded_file = request.FILES.get("file")
+    file_path = request.data.get("file_path")
+    temp_path = None
+
+    try:
+        if uploaded_file:
+            temp_path = f"/tmp/{uuid.uuid4()}_{uploaded_file.name}"
+            with open(temp_path, "wb+") as dest:
+                for chunk in uploaded_file.chunks():
+                    dest.write(chunk)
+            target_path = temp_path
+        elif file_path and os.path.exists(file_path):
+            target_path = file_path
+        else:
+            return Response(
+                {"error": "A valid PDF 'file' or existent 'file_path' is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        total_chunks = ingest_document_chunks(document_id, target_path)
+        return Response(
+            {
+                "status": "indexed",
+                "document_id": document_id,
+                "chunks_indexed": total_chunks,
+            },
+            status=status.HTTP_200_OK,
+        )
+    except Exception as e:
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+@api_view(['POST'])
+def document_chat(request, document_id):
+    """
+    Accepts { "question": "..." } (or { "query": "..." }), runs privacy-preserving
+    hybrid RAG over sanitized chunks, and returns the re-hydrated answer + citations.
+    """
+    question = (request.data.get("question") or request.data.get("query") or "").strip()
+    if not question:
+        return Response({"error": "Field 'question' is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        result = answer_document_query(document_id, question)
+        return Response(result, status=status.HTTP_200_OK)
+    except ValueError as ve:
+        return Response({"error": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class DocumentChatView(APIView):

@@ -710,4 +710,133 @@ export async function documentRoutes(
       }
     },
   );
+  // 14. CHECK RAG INDEX STATUS FOR A DOCUMENT
+  server.get<IdParam>(
+    "/:id/chat/status",
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
+      const { id } = request.params;
+
+      const docCheck = await pool.query(
+        "SELECT id FROM documents WHERE id = $1 AND user_id = $2",
+        [id, request.user.id],
+      );
+      if (docCheck.rowCount === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const chunkRes = await pool.query(
+        "SELECT COUNT(*)::int AS count FROM document_chunks WHERE document_id = $1",
+        [id],
+      );
+      const chunksCount = chunkRes.rows[0]?.count ?? 0;
+
+      return reply.send({
+        indexed: chunksCount > 0,
+        chunks_indexed: chunksCount,
+      });
+    },
+  );
+
+  // 15. INGEST & INDEX DOCUMENT FOR PRIVACY-PRESERVING RAG CHAT
+  server.post<IdParam>(
+    "/:id/ingest",
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
+      const { id } = request.params;
+
+      const docResult = await pool.query(
+        "SELECT id, file_path, original_filename FROM documents WHERE id = $1 AND user_id = $2",
+        [id, request.user.id],
+      );
+
+      if (docResult.rows.length === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const doc = docResult.rows[0];
+      const diskPath = path.join(
+        process.cwd(),
+        doc.file_path.replace(/^\//, ""),
+      );
+
+      if (!fs.existsSync(diskPath)) {
+        return reply.status(404).send({ error: "PDF file missing on disk." });
+      }
+
+      try {
+        const fileBuffer = await fs.promises.readFile(diskPath);
+        const formData = new FormData();
+        formData.append(
+          "file",
+          new Blob([fileBuffer], { type: "application/pdf" }),
+          doc.original_filename || "document.pdf",
+        );
+
+        const aiBaseUrl =
+          process.env.AI_SERVICE_URL || "http://127.0.0.1:8000/api";
+        const aiRes = await fetch(`${aiBaseUrl}/documents/${id}/ingest/`, {
+          method: "POST",
+          body: formData,
+        });
+
+        const data = await aiRes.json();
+        if (!aiRes.ok) {
+          return reply.status(aiRes.status).send(data);
+        }
+
+        return reply.send(data);
+      } catch (err) {
+        server.log.error(err);
+        return reply
+          .status(502)
+          .send({ error: "Failed to reach AI indexing service." });
+      }
+    },
+  );
+
+  // 16. PRIVACY-PRESERVING DOCUMENT CHAT QUERY
+  server.post<{ Params: { id: string }; Body: { question: string } }>(
+    "/:id/chat",
+    { preHandler: [server.authenticate] },
+    async (request, reply) => {
+      const { id } = request.params;
+      const { question } = request.body || {};
+
+      if (!question || !question.trim()) {
+        return reply.status(400).send({ error: "Question is required." });
+      }
+
+      const docCheck = await pool.query(
+        "SELECT id FROM documents WHERE id = $1 AND user_id = $2",
+        [id, request.user.id],
+      );
+
+      if (docCheck.rowCount === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      try {
+        const aiBaseUrl =
+          process.env.AI_SERVICE_URL || "http://127.0.0.1:8000/api";
+        const aiRes = await fetch(`${aiBaseUrl}/documents/${id}/chat/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: question.trim() }),
+        });
+
+        const data = await aiRes.json();
+        if (!aiRes.ok) {
+          return reply.status(aiRes.status).send(data);
+        }
+
+        return reply.send(data);
+      } catch (err) {
+        server.log.error(err);
+        return reply
+          .status(502)
+          .send({ error: "Failed to reach AI chat service." });
+      }
+    },
+  );
 }

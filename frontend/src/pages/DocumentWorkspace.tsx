@@ -36,6 +36,9 @@ import {
   Lock,
   Fingerprint,
   Download,
+  MessageSquare,
+  Send,
+  FileText,
 } from "lucide-react";
 
 interface DocumentItem extends BaseDocumentItem {
@@ -87,6 +90,20 @@ interface AuditData {
   }>;
 }
 
+interface ChatCitation {
+  chunk_id: string;
+  page_number: number;
+  similarity: number;
+  snippet: string;
+}
+
+interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  citations?: ChatCitation[];
+}
+
 export const DocumentWorkspace: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -102,6 +119,16 @@ export const DocumentWorkspace: React.FC = () => {
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [reloadTrigger, setReloadTrigger] = useState(0);
 
+  // Privacy-Preserving RAG Chat State
+  const [isChatIndexed, setIsChatIndexed] = useState(false);
+  const [indexedChunksCount, setIndexedChunksCount] = useState(0);
+  const [isIndexingChat, setIsIndexingChat] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isSendingChat, setIsSendingChat] = useState(false);
+  const [highlightedPage, setHighlightedPage] = useState<number | null>(null);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
   // Export State
   const [exportingType, setExportingType] = useState<
     "redacted" | "signed" | null
@@ -111,10 +138,10 @@ export const DocumentWorkspace: React.FC = () => {
   const [triageLoading, setTriageLoading] = useState(false);
   const [triageError, setTriageError] = useState<string | null>(null);
 
-  // Right Drawer Tab State ('audit' | 'signers')
-  const [activeRightTab, setActiveRightTab] = useState<"audit" | "signers">(
-    "audit",
-  );
+  // Right Drawer Tab State ('audit' | 'signers' | 'chat')
+  const [activeRightTab, setActiveRightTab] = useState<
+    "audit" | "signers" | "chat"
+  >("audit");
   const [showRedlineModal, setShowRedlineModal] = useState(false);
   const [showCertificateModal, setShowCertificateModal] = useState(false);
 
@@ -146,16 +173,21 @@ export const DocumentWorkspace: React.FC = () => {
       if (!id) return;
       try {
         setError(null);
-        const [docRes, tabsRes, auditRes] = await Promise.all([
+        const [docRes, tabsRes, auditRes, chatStatusRes] = await Promise.all([
           apiClient.get(`/documents/${id}`),
           apiClient.get(`/documents/${id}/tabs`),
           apiClient.get(`/documents/${id}/audit`),
+          apiClient
+            .get(`/documents/${id}/chat/status`)
+            .catch(() => ({ data: { indexed: false, chunks_indexed: 0 } })),
         ]);
 
         if (isMounted) {
           setDocumentData(docRes.data.document);
           setSigners(docRes.data.signers || []);
           setTabs(tabsRes.data.tabs || []);
+          setIsChatIndexed(Boolean(chatStatusRes.data?.indexed));
+          setIndexedChunksCount(chatStatusRes.data?.chunks_indexed ?? 0);
 
           if (auditRes.data.audit) {
             setAuditData({
@@ -184,9 +216,92 @@ export const DocumentWorkspace: React.FC = () => {
     };
   }, [id, reloadTrigger]);
 
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages, isSendingChat]);
+
   const refreshWorkspace = useCallback(() => {
     setReloadTrigger((prev) => prev + 1);
   }, []);
+
+  // Privacy-Preserving RAG Indexing & Chat Handlers
+  const handleIndexForChat = async () => {
+    if (!id) return;
+    setIsIndexingChat(true);
+    try {
+      const res = await apiClient.post(`/documents/${id}/ingest`);
+      const count = res.data?.chunks_indexed ?? 0;
+      setIsChatIndexed(true);
+      setIndexedChunksCount(count);
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `Document indexed with Zero-Leakage Surrogate Shield (${count} sanitized chunks). Ask anything about clauses, obligations, liability caps, or dates.`,
+        },
+      ]);
+    } catch (err: unknown) {
+      const resp = (
+        err as { response?: { data?: { error?: string; message?: string } } }
+      )?.response?.data;
+      setError(
+        resp?.message || resp?.error || "Failed to index document for AI chat.",
+      );
+    } finally {
+      setIsIndexingChat(false);
+    }
+  };
+
+  const handleSendChat = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const question = chatInput.trim();
+    if (!question || !id || isSendingChat) return;
+
+    const userMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: question,
+    };
+    setChatMessages((prev) => [...prev, userMsg]);
+    setChatInput("");
+    setIsSendingChat(true);
+
+    try {
+      const res = await apiClient.post(`/documents/${id}/chat`, { question });
+      const assistantMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: res.data?.answer || "No response received.",
+        citations: res.data?.citations || [],
+      };
+      setChatMessages((prev) => [...prev, assistantMsg]);
+    } catch (err: unknown) {
+      const resp = (
+        err as { response?: { data?: { error?: string; message?: string } } }
+      )?.response?.data;
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content:
+            resp?.message || resp?.error || "Error querying document AI.",
+        },
+      ]);
+    } finally {
+      setIsSendingChat(false);
+    }
+  };
+
+  const handleJumpToPage = (pageNumber: number) => {
+    const pageEl = document.getElementById(`pdf-page-${pageNumber}`);
+    if (pageEl) {
+      pageEl.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightedPage(pageNumber);
+      setTimeout(() => setHighlightedPage(null), 2200);
+    }
+  };
 
   // Hardened PDF Flattening & Export Handler
   const handleExportPdf = async (type: "redacted" | "signed") => {
@@ -561,6 +676,22 @@ export const DocumentWorkspace: React.FC = () => {
         </div>
       </header>
 
+      {/* Inline Error Banner */}
+      {error && documentData && (
+        <div className="bg-rose-950/90 border-b border-rose-500/40 px-4 py-2 flex items-center justify-between text-xs text-rose-200 z-30 shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{error}</span>
+          </div>
+          <button
+            onClick={() => setError(null)}
+            className="text-rose-400 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* 3-Pane Body */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left Toolbar: Fields Palette */}
@@ -670,12 +801,15 @@ export const DocumentWorkspace: React.FC = () => {
               return (
                 <div
                   key={`page_${pageNumber}`}
+                  id={`pdf-page-${pageNumber}`}
                   onClick={(e) => handlePageClick(pageNumber, e)}
                   onMouseMove={handlePageMouseMove}
-                  className={`relative mb-6 shadow-2xl rounded-sm overflow-hidden border border-slate-800 ${
-                    selectedTool
-                      ? "cursor-crosshair ring-2 ring-indigo-500/30"
-                      : "cursor-default"
+                  className={`relative mb-6 shadow-2xl rounded-sm overflow-hidden border border-slate-800 transition-all duration-300 ${
+                    highlightedPage === pageNumber
+                      ? "ring-4 ring-amber-400/80"
+                      : selectedTool
+                        ? "cursor-crosshair ring-2 ring-indigo-500/30"
+                        : "cursor-default"
                   }`}
                 >
                   <Page
@@ -758,24 +892,24 @@ export const DocumentWorkspace: React.FC = () => {
           </Document>
         </main>
 
-        {/* Right Drawer: AI Risk Audit & Signers */}
-        <aside className="w-88 border-l border-slate-800/80 bg-slate-900/30 backdrop-blur-xl p-4 flex flex-col shrink-0 overflow-y-auto space-y-4">
-          {/* Drawer Tab Switcher */}
-          <div className="grid grid-cols-2 p-1 bg-slate-950/80 border border-slate-800 rounded-xl">
+        {/* Right Drawer: AI Risk Audit, Signers & Privacy-Preserving Chat */}
+        <aside className="w-96 border-l border-slate-800/80 bg-slate-900/30 backdrop-blur-xl p-4 flex flex-col shrink-0 overflow-hidden space-y-4">
+          {/* 3-Tab Drawer Switcher */}
+          <div className="grid grid-cols-3 p-1 bg-slate-950/80 border border-slate-800 rounded-xl shrink-0">
             <button
               onClick={() => setActiveRightTab("audit")}
-              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition ${
+              className={`flex items-center justify-center gap-1 py-1.5 text-[11px] font-semibold rounded-lg transition ${
                 activeRightTab === "audit"
                   ? "bg-slate-800 text-indigo-300 shadow-sm"
                   : "text-slate-400 hover:text-white"
               }`}
             >
               <Sparkles className="w-3.5 h-3.5" />
-              <span>AI Risk Audit</span>
+              <span>Risk Audit</span>
             </button>
             <button
               onClick={() => setActiveRightTab("signers")}
-              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition ${
+              className={`flex items-center justify-center gap-1 py-1.5 text-[11px] font-semibold rounded-lg transition ${
                 activeRightTab === "signers"
                   ? "bg-slate-800 text-indigo-300 shadow-sm"
                   : "text-slate-400 hover:text-white"
@@ -784,11 +918,22 @@ export const DocumentWorkspace: React.FC = () => {
               <Users className="w-3.5 h-3.5" />
               <span>Signers ({signers.length})</span>
             </button>
+            <button
+              onClick={() => setActiveRightTab("chat")}
+              className={`flex items-center justify-center gap-1 py-1.5 text-[11px] font-semibold rounded-lg transition ${
+                activeRightTab === "chat"
+                  ? "bg-slate-800 text-amber-300 shadow-sm"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>AI Chat</span>
+            </button>
           </div>
 
           {/* Tab 1: AI Risk Engine & Legal Gatekeeper */}
           {activeRightTab === "audit" && (
-            <div className="space-y-4">
+            <div className="space-y-4 overflow-y-auto flex-1 pr-1">
               {/* Asynchronous Live WebSocket Tracker */}
               {isAuditRunning && id && (
                 <div className="p-3 bg-slate-950/80 border border-indigo-500/30 rounded-xl space-y-2">
@@ -946,8 +1091,7 @@ export const DocumentWorkspace: React.FC = () => {
 
           {/* Tab 2: Recipients */}
           {activeRightTab === "signers" && (
-            <div className="space-y-4">
-              {/* Approval Gate Warning Banner */}
+            <div className="space-y-4 overflow-y-auto flex-1 pr-1">
               {hasHighRiskUnapproved && (
                 <div className="p-3 bg-amber-950/40 border border-amber-500/40 rounded-xl text-xs text-amber-300 space-y-1">
                   <p className="font-bold flex items-center gap-1.5">
@@ -1085,6 +1229,128 @@ export const DocumentWorkspace: React.FC = () => {
                   ))}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Tab 3: Privacy-Preserving AI Document Chat */}
+          {activeRightTab === "chat" && (
+            <div className="flex flex-col flex-1 overflow-hidden">
+              {/* Zero-Leakage Surrogate Shield Banner */}
+              <div className="p-3 mb-3 rounded-xl bg-emerald-950/35 border border-emerald-500/30 flex items-center justify-between gap-2 shrink-0">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span className="truncate">Zero-Leakage Surrogate RAG</span>
+                  </p>
+                  <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">
+                    {isChatIndexed
+                      ? `Indexed (${indexedChunksCount} chunks) • PII masked before LLM`
+                      : "PII masked into <SURROGATE> tokens before embedding"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleIndexForChat}
+                  disabled={isIndexingChat}
+                  className="px-2.5 py-1.5 text-[11px] font-semibold rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 disabled:opacity-50 shrink-0 transition flex items-center gap-1"
+                >
+                  {isIndexingChat && (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  )}
+                  <span>
+                    {isIndexingChat
+                      ? "Indexing..."
+                      : isChatIndexed
+                        ? "Re-Index"
+                        : "Index PDF"}
+                  </span>
+                </button>
+              </div>
+
+              {/* Chat Messages Feed */}
+              <div className="flex-1 overflow-y-auto space-y-3 pr-1 select-text">
+                {chatMessages.length === 0 ? (
+                  <div className="text-center py-8 px-4 text-slate-400 text-xs space-y-2 bg-slate-950/40 border border-slate-800/80 rounded-xl">
+                    <p className="font-semibold text-slate-200">
+                      Ask anything about this contract
+                    </p>
+                    <p className="text-[11px] leading-relaxed">
+                      {isChatIndexed
+                        ? 'Try: "Who are the parties involved?" or "What are the termination & liability obligations?"'
+                        : 'Click "Index PDF" above to sanitize PII and generate local pgvector embeddings.'}
+                    </p>
+                  </div>
+                ) : (
+                  chatMessages.map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={`p-3 rounded-xl text-xs leading-relaxed ${
+                        msg.role === "user"
+                          ? "bg-amber-500/15 border border-amber-500/30 text-amber-100 ml-5"
+                          : "bg-slate-950/80 border border-slate-800 text-slate-200 mr-2"
+                      }`}
+                    >
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+
+                      {msg.citations && msg.citations.length > 0 && (
+                        <div className="mt-2.5 pt-2 border-t border-slate-800/90 flex flex-wrap gap-1.5">
+                          {msg.citations.map((cit, idx) => (
+                            <button
+                              key={`${cit.chunk_id}-${idx}`}
+                              type="button"
+                              onClick={() => handleJumpToPage(cit.page_number)}
+                              title={cit.snippet}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/35 text-[10px] font-semibold transition cursor-pointer"
+                            >
+                              <FileText className="w-2.5 h-2.5" />
+                              <span>
+                                Page {cit.page_number} (
+                                {Math.round(cit.similarity * 100)}%)
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
+
+                {isSendingChat && (
+                  <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 text-xs text-slate-400 flex items-center gap-2 mr-4">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                    <span>Searching sanitized vectors & synthesizing...</span>
+                  </div>
+                )}
+                <div ref={chatBottomRef} />
+              </div>
+
+              {/* Query Input Bar */}
+              <form
+                onSubmit={handleSendChat}
+                className="mt-3 pt-3 border-t border-slate-800 flex gap-2 shrink-0"
+              >
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder={
+                    isChatIndexed
+                      ? "Ask about clauses, liability, dates..."
+                      : "Index PDF first to enable chat..."
+                  }
+                  disabled={!isChatIndexed || isSendingChat}
+                  className="flex-1 bg-slate-950/90 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-amber-500 disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={
+                    !isChatIndexed || isSendingChat || !chatInput.trim()
+                  }
+                  className="px-3 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-semibold disabled:opacity-50 transition flex items-center gap-1"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                </button>
+              </form>
             </div>
           )}
         </aside>
