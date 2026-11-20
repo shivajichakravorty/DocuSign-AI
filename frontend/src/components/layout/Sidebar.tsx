@@ -9,24 +9,52 @@ import {
   LifeBuoy,
 } from "lucide-react";
 
+export type DocumentFilter = "all" | "pending" | "completed" | "flagged";
+
+interface SidebarProps {
+  activeFilter: DocumentFilter;
+  onFilterChange: (filter: DocumentFilter) => void;
+  counts: {
+    all: number;
+    pending: number;
+    completed: number;
+    flagged: number;
+  };
+  onOpenDocs?: () => void;
+  onOpenSettings?: () => void;
+}
+
 interface NavItemProps {
   icon: React.ReactNode;
   label: string;
   count?: number;
   active?: boolean;
+  onClick?: () => void;
 }
 
-const NavItem: React.FC<NavItemProps> = ({ icon, label, count, active }) => (
+const NavItem: React.FC<NavItemProps> = ({
+  icon,
+  label,
+  count,
+  active,
+  onClick,
+}) => (
   <button
+    type="button"
+    onClick={onClick}
     className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl font-medium text-sm transition-all duration-200 group ${
       active
         ? "bg-indigo-600/15 text-indigo-400 border border-indigo-500/20 shadow-sm shadow-indigo-500/10"
-        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"
+        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
     }`}
   >
     <div className="flex items-center gap-3">
       <span
-        className={`transition-transform duration-200 group-hover:scale-110 ${active ? "text-indigo-400" : "text-slate-400 group-hover:text-slate-200"}`}
+        className={`transition-transform duration-200 group-hover:scale-110 ${
+          active
+            ? "text-indigo-400"
+            : "text-slate-400 group-hover:text-slate-200"
+        }`}
       >
         {icon}
       </span>
@@ -46,13 +74,19 @@ const NavItem: React.FC<NavItemProps> = ({ icon, label, count, active }) => (
   </button>
 );
 
-export const Sidebar: React.FC = () => {
+export const Sidebar: React.FC<SidebarProps> = ({
+  activeFilter,
+  onFilterChange,
+  counts,
+  onOpenDocs,
+  onOpenSettings,
+}) => {
   return (
     <aside className="w-64 border-r border-slate-800/80 bg-slate-950/70 backdrop-blur-2xl flex flex-col justify-between p-4 shrink-0 selection:bg-indigo-500 selection:text-white">
       <div>
         {/* Brand identity */}
         <div className="flex items-center gap-3 px-3 py-3 mb-6">
-          <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 shadow-lg shadow-indigo-500/25 ring-1 ring-white/20">
+          <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-linear-to-r from-indigo-600 to-violet-500 shadow-lg shadow-indigo-500/25 ring-1 ring-white/20">
             <ShieldCheck className="w-5 h-5 text-white" />
           </div>
           <div>
@@ -78,23 +112,30 @@ export const Sidebar: React.FC = () => {
               <NavItem
                 icon={<FileText className="w-4 h-4" />}
                 label="All Documents"
-                count={12}
-                active
+                count={counts.all}
+                active={activeFilter === "all"}
+                onClick={() => onFilterChange("all")}
               />
               <NavItem
                 icon={<Send className="w-4 h-4" />}
                 label="Out for Signature"
-                count={4}
+                count={counts.pending}
+                active={activeFilter === "pending"}
+                onClick={() => onFilterChange("pending")}
               />
               <NavItem
                 icon={<CheckCircle2 className="w-4 h-4" />}
                 label="Completed"
-                count={8}
+                count={counts.completed}
+                active={activeFilter === "completed"}
+                onClick={() => onFilterChange("completed")}
               />
               <NavItem
                 icon={<Sparkles className="w-4 h-4" />}
                 label="AI Audit Risk"
-                count={2}
+                count={counts.flagged}
+                active={activeFilter === "flagged"}
+                onClick={() => onFilterChange("flagged")}
               />
             </div>
           </div>
@@ -106,8 +147,13 @@ export const Sidebar: React.FC = () => {
         <NavItem
           icon={<LifeBuoy className="w-4 h-4" />}
           label="Documentation"
+          onClick={onOpenDocs}
         />
-        <NavItem icon={<Settings className="w-4 h-4" />} label="Settings" />
+        <NavItem
+          icon={<Settings className="w-4 h-4" />}
+          label="Settings"
+          onClick={onOpenSettings}
+        />
       </div>
     </aside>
   );
