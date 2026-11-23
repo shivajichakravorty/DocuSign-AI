@@ -39,19 +39,33 @@ export const AuditCertificateModal: React.FC<{
 }> = ({ documentId, onClose }) => {
   const [data, setData] = useState<VerificationData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
 
   useEffect(() => {
     let isMounted = true;
     async function loadVerification() {
       try {
-        const res = await apiClient.get(`/verify/${documentId}`);
+        const res = await apiClient.get(`/signing/verify/${documentId}`);
         if (isMounted) setData(res.data);
+      } catch (err: unknown) {
+        if (isMounted) {
+          const resp = (
+            err as {
+              response?: { data?: { error?: string; message?: string } };
+            }
+          )?.response?.data;
+          setError(
+            resp?.message ||
+              resp?.error ||
+              "Failed to load cryptographic seal data.",
+          );
+        }
       } finally {
         if (isMounted) setLoading(false);
       }
     }
-    loadVerification();
+    void loadVerification();
     return () => {
       isMounted = false;
     };
@@ -74,7 +88,28 @@ export const AuditCertificateModal: React.FC<{
     );
   }
 
-  if (!data) return null;
+  if (error || !data) {
+    return (
+      <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-md w-full space-y-4">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-bold text-rose-400">
+              Verification Unavailable
+            </span>
+            <button
+              onClick={onClose}
+              className="text-slate-400 hover:text-white"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <p className="text-xs text-slate-400">
+            {error || "No seal record found for this document."}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
@@ -83,9 +118,16 @@ export const AuditCertificateModal: React.FC<{
         <div className="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/60">
           <div className="flex items-center gap-2">
             <Fingerprint className="w-5 h-5 text-indigo-400" />
-            <h2 className="text-sm font-bold text-white">
-              Cryptographic Certificate of Completion
-            </h2>
+            <div>
+              <h2 className="text-sm font-bold text-white">
+                Cryptographic Certificate of Completion
+              </h2>
+              {data.certificate?.certificate_number && (
+                <p className="text-[10px] font-mono text-indigo-400">
+                  {data.certificate.certificate_number}
+                </p>
+              )}
+            </div>
           </div>
           <button
             onClick={onClose}
@@ -178,29 +220,35 @@ export const AuditCertificateModal: React.FC<{
             <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
               Signer Telemetry Ledger
             </h3>
-            <div className="space-y-2">
-              {data.auditTrail.map((log) => (
-                <div
-                  key={log.id}
-                  className="p-3 bg-slate-950/50 border border-slate-800 rounded-xl text-xs space-y-1"
-                >
-                  <div className="flex justify-between font-semibold text-slate-200">
-                    <span>
-                      {log.full_name} ({log.email})
-                    </span>
-                    <span className="font-mono text-[10px] text-slate-400">
-                      {log.ip_address}
-                    </span>
+            {data.auditTrail.length === 0 ? (
+              <p className="text-xs text-slate-500 p-3 bg-slate-950/50 border border-slate-800 rounded-xl">
+                No cryptographic signature events recorded yet.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {data.auditTrail.map((log) => (
+                  <div
+                    key={log.id}
+                    className="p-3 bg-slate-950/50 border border-slate-800 rounded-xl text-xs space-y-1"
+                  >
+                    <div className="flex justify-between font-semibold text-slate-200">
+                      <span>
+                        {log.full_name} ({log.email})
+                      </span>
+                      <span className="font-mono text-[10px] text-slate-400">
+                        {log.ip_address}
+                      </span>
+                    </div>
+                    <p className="font-mono text-[10px] text-indigo-400 truncate">
+                      Checksum: {log.signature_checksum}
+                    </p>
+                    <p className="text-[10px] text-slate-500">
+                      Signed at: {new Date(log.timestamp).toUTCString()}
+                    </p>
                   </div>
-                  <p className="font-mono text-[10px] text-indigo-400 truncate">
-                    Checksum: {log.signature_checksum}
-                  </p>
-                  <p className="text-[10px] text-slate-500">
-                    Signed at: {new Date(log.timestamp).toUTCString()}
-                  </p>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>

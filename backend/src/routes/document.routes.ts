@@ -323,13 +323,25 @@ export async function documentRoutes(
         });
       }
 
+      const existingSigner = await pool.query(
+        `SELECT id FROM signers WHERE document_id = $1 AND LOWER(email) = LOWER($2)`,
+        [id, email.trim()],
+      );
+
+      if ((existingSigner.rowCount ?? 0) > 0) {
+        return reply.status(409).send({
+          error: "Duplicate Signer",
+          message: "This recipient has already been added to this document.",
+        });
+      }
+
       const token = crypto.randomBytes(32).toString("hex");
 
       const result = await pool.query(
         `INSERT INTO signers (document_id, email, full_name, role, signing_order, token, status)
          VALUES ($1, $2, $3, $4, $5, $6, 'pending')
          RETURNING id, document_id, email, full_name, role, signing_order, token, status, created_at`,
-        [id, email, full_name, role, signing_order, token],
+        [id, email.trim(), full_name.trim(), role, signing_order, token],
       );
 
       await pool.query(
@@ -377,7 +389,7 @@ export async function documentRoutes(
       const tabsResult = await pool.query(
         `SELECT * FROM signature_tabs 
          WHERE document_id = $1 AND (signer_id = $2 OR signer_id IS NULL)
-         ORDER BY page_number ASC`,
+         ORDER BY page_number ASC, created_at ASC`,
         [signer.document_id, signer.id],
       );
 
@@ -388,6 +400,7 @@ export async function documentRoutes(
           full_name: signer.full_name,
           role: signer.role,
           status: signer.status,
+          signed_at: signer.signed_at,
         },
         document: {
           id: signer.document_id,
@@ -607,7 +620,6 @@ export async function documentRoutes(
       const exportType =
         request.query.type === "redacted" ? "redacted" : "signed";
 
-      // 1. Verify document ownership
       const docResult = await pool.query(
         "SELECT * FROM documents WHERE id = $1 AND user_id = $2",
         [id, request.user.id],
@@ -630,7 +642,6 @@ export async function documentRoutes(
       }
 
       try {
-        // 2. Fetch redactions, tabs, signers, and latest audit log
         const [redactionsRes, tabsRes, signersRes, auditRes] =
           await Promise.all([
             pool.query(
@@ -659,7 +670,6 @@ export async function documentRoutes(
         );
         formData.append("redactions", JSON.stringify(redactionsRes.rows));
 
-        // Only burn tabs & append certificate on 'signed' export
         if (exportType === "signed") {
           formData.append("tabs", JSON.stringify(tabsRes.rows));
           const latestAudit = auditRes.rows[0];
@@ -710,6 +720,7 @@ export async function documentRoutes(
       }
     },
   );
+
   // 14. CHECK RAG INDEX STATUS FOR A DOCUMENT
   server.get<IdParam>(
     "/:id/chat/status",

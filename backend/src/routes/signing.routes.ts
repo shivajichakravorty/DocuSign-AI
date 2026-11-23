@@ -53,6 +53,14 @@ export async function signingRoutes(server: FastifyInstance) {
       }
 
       const signer = signerRes.rows[0];
+
+      if (signer.status === "completed" || signer.status === "signed") {
+        return reply.status(409).send({
+          error: "Already Signed",
+          message: "This signing link has already been completed.",
+        });
+      }
+
       const docId = signer.doc_id;
       const ipAddress =
         (request.headers["x-forwarded-for"] as string) ||
