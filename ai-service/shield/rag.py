@@ -9,6 +9,7 @@ from google import genai
 import pdfplumber
 from presidio_analyzer import AnalyzerEngine
 import psycopg2
+from ocr import ocr_pdf_page
 
 load_dotenv()
 
@@ -113,8 +114,9 @@ def chunk_text(text: str, chunk_size: int = 350, overlap: int = 50) -> list[str]
 
 def ingest_document_chunks(document_id: str, file_path: str) -> int:
     """
-    Extracts text per page with pdfplumber, masks PII into reversible surrogate tokens,
-    embeds sanitized chunks locally with FastEmbed, and persists to PostgreSQL pgvector.
+    Extracts text per page with pdfplumber (falling back to Tesseract OCR for scanned pages),
+    masks PII into reversible surrogate tokens, embeds sanitized chunks locally with FastEmbed,
+    and persists to PostgreSQL pgvector.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -129,7 +131,12 @@ def ingest_document_chunks(document_id: str, file_path: str) -> int:
     with pdfplumber.open(file_path) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             page_num = page_idx + 1
-            page_text = page.extract_text() or ""
+            page_text = (page.extract_text() or "").strip()
+
+            # Fallback to Tesseract OCR if page has no selectable text (scanned/image PDF)
+            if not page_text:
+                page_text = ocr_pdf_page(file_path, page_idx)["text"]
+
             if not page_text.strip():
                 continue
 
@@ -169,7 +176,6 @@ def ingest_document_chunks(document_id: str, file_path: str) -> int:
     cur.close()
     conn.close()
     return total_chunks
-
 
 def _get_document_token_map(document_id: str) -> dict:
     conn = get_db_connection()

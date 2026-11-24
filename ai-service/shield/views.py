@@ -15,6 +15,7 @@ from .extractor import extract_pdf_pii, analyzer, anonymizer
 from shield.rag import answer_document_query, ingest_document_chunks
 from .extractor import extract_pdf_pii, analyzer, anonymizer
 from .auditor import audit_contract_text
+from .ocr import ocr_pdf_page
 
 # Redis Client for Pub/Sub progress telemetry
 REDIS_HOST = getattr(settings, "REDIS_HOST", "127.0.0.1")
@@ -103,18 +104,20 @@ def scan_document_pii(request):
 
         emit_progress(document_id, "file_verification", "done", 25)
 
-        # 1. Spatial PII Extraction
+        # 1. Spatial PII Extraction (automatically falls back to Tesseract OCR per page)
         emit_progress(document_id, "pii_masking", "running", 35)
         pages_result = extract_pdf_pii(target_path)
         total_pii = sum(p.get("entities_count", 0) for p in pages_result)
         emit_progress(document_id, "pii_masking", "done", 55, {"total_pii": total_pii})
 
-        # 2. Extract complete text for clause auditing
+        # 2. Extract complete text for clause auditing (with Tesseract OCR fallback)
         emit_progress(document_id, "text_extraction", "running", 65)
         full_text = ""
         with pdfplumber.open(target_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
+            for idx, page in enumerate(pdf.pages):
+                page_text = (page.extract_text() or "").strip()
+                if not page_text:
+                    page_text = ocr_pdf_page(target_path, idx)["text"]
                 full_text += page_text + "\n"
         emit_progress(document_id, "text_extraction", "done", 75)
 
@@ -145,7 +148,6 @@ def scan_document_pii(request):
                 os.remove(temp_path)
             except OSError:
                 pass
-
 
 @api_view(['POST'])
 def document_chat(request, document_id):

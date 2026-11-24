@@ -35,6 +35,7 @@ export async function authRoutes(
   // Register
   server.post(
     "/register",
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (
       request: FastifyRequest<{ Body: RegisterBody }>,
       reply: FastifyReply,
@@ -72,6 +73,7 @@ export async function authRoutes(
   // Login
   server.post(
     "/login",
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (
       request: FastifyRequest<{ Body: LoginBody }>,
       reply: FastifyReply,
@@ -148,6 +150,7 @@ export async function authRoutes(
   // Forgot Password
   server.post(
     "/forgot-password",
+    { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } },
     async (
       request: FastifyRequest<{ Body: ForgotPasswordBody }>,
       reply: FastifyReply,
@@ -203,6 +206,7 @@ export async function authRoutes(
   // Reset Password
   server.post(
     "/reset-password",
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (
       request: FastifyRequest<{ Body: ResetPasswordBody }>,
       reply: FastifyReply,

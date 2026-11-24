@@ -1,6 +1,7 @@
 import pdfplumber
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
 from presidio_anonymizer import AnonymizerEngine
+from .ocr import ocr_pdf_page
 
 analyzer = AnalyzerEngine()
 anonymizer = AnonymizerEngine()
@@ -10,34 +11,41 @@ ssn_pattern = Pattern(name="ssn_regex", regex=r"\b\d{3}-\d{2}-\d{4}\b", score=0.
 ssn_recognizer = PatternRecognizer(supported_entity="US_SSN", patterns=[ssn_pattern])
 analyzer.registry.add_recognizer(ssn_recognizer)
 
+
 def extract_pdf_pii(file_path: str):
     """
-    Extracts text from each PDF page, detects PII entities, 
-    and computes normalized page-relative bounding boxes for the frontend viewer.
+    Extracts text from each PDF page (falling back to Tesseract OCR for scanned pages),
+    detects PII entities, and computes normalized page-relative bounding boxes.
     """
     results = []
-    
+
     with pdfplumber.open(file_path) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             page_num = page_idx + 1
             page_width = float(page.width)
             page_height = float(page.height)
-            
+
             # Extract words with spatial bounding boxes
             words = page.extract_words(use_text_flow=True, extra_attrs=["fontname", "size"])
+
+            # Fallback to Tesseract OCR if the page is scanned/image-only
+            if not words:
+                ocr_res = ocr_pdf_page(file_path, page_idx)
+                words = ocr_res["words"]
+
             if not words:
                 continue
 
             # Construct continuous text and track character-to-word mappings
             page_text = ""
             char_word_map = []
-            
+
             for word_idx, w in enumerate(words):
                 word_text = w["text"]
                 start_char = len(page_text)
                 page_text += word_text + " "
                 end_char = len(page_text) - 1
-                
+
                 char_word_map.append({
                     "start": start_char,
                     "end": end_char,

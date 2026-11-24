@@ -15,6 +15,7 @@ import { healthRoutes } from "./routes/health.routes.js";
 import { authRoutes } from "./routes/auth.routes.js";
 import { documentRoutes } from "./routes/document.routes.js";
 import { approvalRoutes } from "./routes/approval.routes.js";
+import rateLimit from "@fastify/rate-limit";
 
 const uploadsDir = path.resolve(process.cwd(), "uploads");
 const server = Fastify({ logger: true });
@@ -59,6 +60,16 @@ async function buildServer() {
   await server.register(documentRoutes, { prefix: "/api/documents" });
   await server.register(approvalRoutes, { prefix: "/api/documents" });
   await server.register(signingRoutes, { prefix: "/api/signing" });
+
+  await server.register(rateLimit, {
+    max: 120,
+    timeWindow: "1 minute",
+    errorResponseBuilder: (_request, context) => ({
+      statusCode: 429,
+      error: "Too Many Requests",
+      message: `Rate limit exceeded. Try again in ${Math.ceil(context.ttl / 1000)} seconds.`,
+    }),
+  });
 
   return server;
 }

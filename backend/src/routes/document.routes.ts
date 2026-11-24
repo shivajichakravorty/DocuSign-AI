@@ -68,7 +68,10 @@ export async function documentRoutes(
   // 1. UPLOAD DOCUMENT
   server.post(
     "/upload",
-    { preHandler: [server.authenticate] },
+    {
+      preHandler: [server.authenticate],
+      config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
+    },
     async (request: FastifyRequest, reply: FastifyReply) => {
       const data = await request.file();
 
@@ -417,7 +420,10 @@ export async function documentRoutes(
   // 8. TRIGGER AI PII SCAN & RISK AUDIT (ASYNC via BullMQ)
   server.post<IdParam>(
     "/:id/audit",
-    { preHandler: [server.authenticate] },
+    {
+      preHandler: [server.authenticate],
+      config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
+    },
     async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
       const { id } = request.params;
 
@@ -614,7 +620,10 @@ export async function documentRoutes(
     Querystring: { type?: "redacted" | "signed" };
   }>(
     "/:id/export",
-    { preHandler: [server.authenticate] },
+    {
+      preHandler: [server.authenticate],
+      config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
+    },
     async (request, reply) => {
       const { id } = request.params;
       const exportType =
@@ -752,7 +761,10 @@ export async function documentRoutes(
   // 15. INGEST & INDEX DOCUMENT FOR PRIVACY-PRESERVING RAG CHAT
   server.post<IdParam>(
     "/:id/ingest",
-    { preHandler: [server.authenticate] },
+    {
+      preHandler: [server.authenticate],
+      config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
+    },
     async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
       const { id } = request.params;
 
@@ -809,7 +821,10 @@ export async function documentRoutes(
   // 16. PRIVACY-PRESERVING DOCUMENT CHAT QUERY
   server.post<{ Params: { id: string }; Body: { question: string } }>(
     "/:id/chat",
-    { preHandler: [server.authenticate] },
+    {
+      preHandler: [server.authenticate],
+      config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
+    },
     async (request, reply) => {
       const { id } = request.params;
       const { question } = request.body || {};
