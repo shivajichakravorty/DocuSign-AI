@@ -183,11 +183,19 @@ export const DocumentWorkspace: React.FC = () => {
         ]);
 
         if (isMounted) {
-          setDocumentData(docRes.data.document);
+          const loadedDoc: DocumentItem = docRes.data.document;
+          setDocumentData(loadedDoc);
           setSigners(docRes.data.signers || []);
           setTabs(tabsRes.data.tabs || []);
           setIsChatIndexed(Boolean(chatStatusRes.data?.indexed));
           setIndexedChunksCount(chatStatusRes.data?.chunks_indexed ?? 0);
+
+          if (
+            loadedDoc?.audit_status === "completed" ||
+            loadedDoc?.audit_status === "failed"
+          ) {
+            setAuditing(false);
+          }
 
           if (auditRes.data.audit) {
             setAuditData({
@@ -197,6 +205,8 @@ export const DocumentWorkspace: React.FC = () => {
                   ? JSON.parse(auditRes.data.audit.flags_data)
                   : auditRes.data.audit.flags_data || [],
             });
+          } else {
+            setAuditData(null);
           }
           setRedactions(auditRes.data.entities || []);
           setLoading(false);
@@ -223,6 +233,48 @@ export const DocumentWorkspace: React.FC = () => {
   const refreshWorkspace = useCallback(() => {
     setReloadTrigger((prev) => prev + 1);
   }, []);
+
+  const handleAuditCompleted = useCallback(() => {
+    setAuditing(false);
+    setDocumentData((prev) =>
+      prev ? { ...prev, audit_status: "completed" } : prev,
+    );
+    refreshWorkspace();
+  }, [refreshWorkspace]);
+
+  const handleAuditFailed = useCallback(() => {
+    setAuditing(false);
+    setDocumentData((prev) =>
+      prev ? { ...prev, audit_status: "failed" } : prev,
+    );
+    refreshWorkspace();
+  }, [refreshWorkspace]);
+
+  const isAuditRunning =
+    auditing ||
+    documentData?.audit_status === "queued" ||
+    documentData?.audit_status === "processing";
+
+  // Fallback status poller so Compliance Score & redactions always update automatically
+  useEffect(() => {
+    if (!id || !isAuditRunning) return;
+
+    const interval = window.setInterval(async () => {
+      try {
+        const docRes = await apiClient.get(`/documents/${id}`);
+        const status = docRes.data?.document?.audit_status;
+        if (status === "completed") {
+          handleAuditCompleted();
+        } else if (status === "failed") {
+          handleAuditFailed();
+        }
+      } catch {
+        // Ignore transient polling errors while worker runs
+      }
+    }, 2500);
+
+    return () => window.clearInterval(interval);
+  }, [id, isAuditRunning, handleAuditCompleted, handleAuditFailed]);
 
   // Privacy-Preserving RAG Indexing & Chat Handlers
   const handleIndexForChat = async () => {
@@ -520,11 +572,6 @@ export const DocumentWorkspace: React.FC = () => {
   }
 
   const pdfUrl = `http://localhost:3000${documentData?.file_path}`;
-  const isAuditRunning =
-    auditing ||
-    documentData?.audit_status === "queued" ||
-    documentData?.audit_status === "processing";
-
   const isApproved = documentData?.approval_status === "approved";
   const isRejected = documentData?.approval_status === "rejected";
   const hasHighRiskUnapproved = auditData?.risk_level === "High" && !isApproved;
@@ -940,7 +987,11 @@ export const DocumentWorkspace: React.FC = () => {
                   <p className="text-[11px] font-semibold text-indigo-300">
                     Live Scan Progress
                   </p>
-                  <AuditProgressTracker documentId={id} />
+                  <AuditProgressTracker
+                    documentId={id}
+                    onComplete={handleAuditCompleted}
+                    onError={handleAuditFailed}
+                  />
                 </div>
               )}
 

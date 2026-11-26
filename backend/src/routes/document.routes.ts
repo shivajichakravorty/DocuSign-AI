@@ -4,19 +4,17 @@ import {
   FastifyRequest,
   FastifyReply,
 } from "fastify";
-import fs from "node:fs";
-import { pipeline } from "node:stream/promises";
 import crypto from "node:crypto";
 import path from "node:path";
 import { pool } from "../db.js";
 import "@fastify/multipart";
 import { auditQueue, redisConnection } from "../queues/audit.queue.js";
-
-const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
-
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-}
+import {
+  uploadPdfBuffer,
+  getPdfBuffer,
+  getPresignedPdfUrl,
+  deleteStoredPdf,
+} from "../services/storage.service.js";
 
 interface IdParam {
   Params: { id: string };
@@ -61,11 +59,19 @@ interface TokenParam {
   Params: { token: string };
 }
 
+async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 export async function documentRoutes(
   server: FastifyInstance,
   _opts: FastifyPluginOptions,
 ) {
-  // 1. UPLOAD DOCUMENT
+  // 1. UPLOAD DOCUMENT (Local Disk or S3/R2 via storage.service.ts)
   server.post(
     "/upload",
     {
@@ -86,22 +92,27 @@ export async function documentRoutes(
       }
 
       const uniqueId = crypto.randomUUID();
-      const sanitizedFilename = `${uniqueId}-${path.basename(data.filename)}`;
-      const savePath = path.join(UPLOADS_DIR, sanitizedFilename);
+      const safeBaseName = path
+        .basename(data.filename)
+        .replace(/[^a-zA-Z0-9._-]/g, "_");
+      const objectKey = `${uniqueId}-${safeBaseName}`;
 
-      let bytesWritten = 0;
+      let storedPath: string | null = null;
       try {
-        await pipeline(
-          data.file,
-          fs.createWriteStream(savePath).on("data", (chunk) => {
-            bytesWritten += chunk.length;
-          }),
-        );
+        const fileBuffer = await streamToBuffer(data.file);
+        if (fileBuffer.length === 0) {
+          return reply.status(400).send({ error: "Uploaded PDF is empty." });
+        }
 
-        const stat = await fs.promises.stat(savePath);
+        const uploaded = await uploadPdfBuffer(
+          objectKey,
+          fileBuffer,
+          data.mimetype,
+        );
+        storedPath = uploaded.publicPath;
 
         const title =
-          (data.fields?.title as any)?.value ||
+          (data.fields?.title as { value?: string } | undefined)?.value ||
           data.filename.replace(/\.pdf$/i, "");
 
         const result = await pool.query(
@@ -113,8 +124,8 @@ export async function documentRoutes(
             request.user.id,
             title,
             data.filename,
-            `/uploads/${sanitizedFilename}`,
-            stat.size,
+            uploaded.publicPath,
+            fileBuffer.length,
             data.mimetype,
           ],
         );
@@ -124,8 +135,8 @@ export async function documentRoutes(
           document: result.rows[0],
         });
       } catch (err) {
-        if (fs.existsSync(savePath)) {
-          await fs.promises.unlink(savePath);
+        if (storedPath) {
+          await deleteStoredPdf(storedPath).catch(() => {});
         }
         server.log.error(err);
         return reply
@@ -176,6 +187,34 @@ export async function documentRoutes(
       return reply.send({
         document: docResult.rows[0],
         signers: signersResult.rows,
+      });
+    },
+  );
+
+  // 3b. GET PRE-SIGNED OBJECT URL (WHEN S3/R2 IS ENABLED)
+  server.get<IdParam>(
+    "/:id/signed-url",
+    { preHandler: [server.authenticate] },
+    async (request: FastifyRequest<IdParam>, reply: FastifyReply) => {
+      const { id } = request.params;
+
+      const docResult = await pool.query(
+        `SELECT id, file_path FROM documents WHERE id = $1 AND user_id = $2`,
+        [id, request.user.id],
+      );
+
+      if (docResult.rows.length === 0) {
+        return reply.status(404).send({ error: "Document not found." });
+      }
+
+      const signedUrl = await getPresignedPdfUrl(
+        docResult.rows[0].file_path,
+        300,
+      );
+
+      return reply.send({
+        url: signedUrl,
+        expires_in_seconds: signedUrl ? 300 : null,
       });
     },
   );
@@ -639,12 +678,11 @@ export async function documentRoutes(
       }
 
       const document = docResult.rows[0];
-      const absoluteFilePath = path.resolve(
-        process.cwd(),
-        `.${document.file_path}`,
-      );
 
-      if (!fs.existsSync(absoluteFilePath)) {
+      let fileBuffer: Buffer;
+      try {
+        fileBuffer = await getPdfBuffer(document.file_path);
+      } catch {
         return reply
           .status(404)
           .send({ error: "Source PDF missing from storage." });
@@ -671,10 +709,9 @@ export async function documentRoutes(
           ]);
 
         const formData = new FormData();
-        const fileBuffer = await fs.promises.readFile(absoluteFilePath);
         formData.append(
           "file",
-          new Blob([fileBuffer], { type: "application/pdf" }),
+          new Blob([new Uint8Array(fileBuffer)], { type: "application/pdf" }),
           document.original_filename,
         );
         formData.append("redactions", JSON.stringify(redactionsRes.rows));
@@ -778,21 +815,21 @@ export async function documentRoutes(
       }
 
       const doc = docResult.rows[0];
-      const diskPath = path.join(
-        process.cwd(),
-        doc.file_path.replace(/^\//, ""),
-      );
 
-      if (!fs.existsSync(diskPath)) {
-        return reply.status(404).send({ error: "PDF file missing on disk." });
+      let fileBuffer: Buffer;
+      try {
+        fileBuffer = await getPdfBuffer(doc.file_path);
+      } catch {
+        return reply
+          .status(404)
+          .send({ error: "PDF file missing from storage." });
       }
 
       try {
-        const fileBuffer = await fs.promises.readFile(diskPath);
         const formData = new FormData();
         formData.append(
           "file",
-          new Blob([fileBuffer], { type: "application/pdf" }),
+          new Blob([new Uint8Array(fileBuffer)], { type: "application/pdf" }),
           doc.original_filename || "document.pdf",
         );
 

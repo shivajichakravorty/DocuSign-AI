@@ -1,26 +1,28 @@
 import os
 import json
+import uuid
 import redis
 import pdfplumber
 from django.conf import settings
+from django.http import HttpResponse
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.views import APIView
-from django.http import FileResponse
-from .flattener import flatten_and_certify_pdf
-import uuid
-from .extractor import extract_pdf_pii, analyzer, anonymizer
 
-from shield.rag import answer_document_query, ingest_document_chunks
 from .extractor import extract_pdf_pii, analyzer, anonymizer
 from .auditor import audit_contract_text
+from .flattener import flatten_and_certify_pdf
 from .ocr import ocr_pdf_page
+from shield.rag import answer_document_query, ingest_document_chunks
 
-# Redis Client for Pub/Sub progress telemetry
-REDIS_HOST = getattr(settings, "REDIS_HOST", "127.0.0.1")
-REDIS_PORT = getattr(settings, "REDIS_PORT", 6379)
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+# Redis Client for Pub/Sub progress telemetry (supports Docker REDIS_URL)
+REDIS_URL = os.getenv("REDIS_URL") or getattr(settings, "REDIS_URL", None)
+if REDIS_URL:
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+else:
+    REDIS_HOST = getattr(settings, "REDIS_HOST", "127.0.0.1")
+    REDIS_PORT = getattr(settings, "REDIS_PORT", 6379)
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
 
 
 def emit_progress(document_id: str, step: str, status_text: str, progress: int, details: dict = None):
@@ -41,16 +43,16 @@ def emit_progress(document_id: str, step: str, status_text: str, progress: int, 
         print(f"[Telemetry Warning] Could not publish progress to Redis: {exc}")
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 def health_check(request):
     return Response({
         "status": "ok",
         "service": "docushield-django-ai",
-        "engine_ready": analyzer is not None
+        "engine_ready": analyzer is not None,
     })
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 def scan_text_pii(request):
     text = request.data.get("text", "")
     if not text:
@@ -64,7 +66,7 @@ def scan_text_pii(request):
             "type": r.entity_type,
             "start": r.start,
             "end": r.end,
-            "score": round(r.score, 3)
+            "score": round(r.score, 3),
         }
         for r in results
     ]
@@ -73,11 +75,11 @@ def scan_text_pii(request):
         "original_text": text,
         "anonymized_text": anonymized_result.text,
         "entities_count": len(entities),
-        "entities": entities
+        "entities": entities,
     })
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 def scan_document_pii(request):
     uploaded_file = request.FILES.get("file")
     file_path = request.data.get("file_path")
@@ -88,7 +90,7 @@ def scan_document_pii(request):
         emit_progress(document_id, "file_verification", "running", 15)
 
         if uploaded_file:
-            temp_path = f"/tmp/{uploaded_file.name}"
+            temp_path = f"/tmp/{uuid.uuid4()}_{uploaded_file.name}"
             with open(temp_path, "wb+") as destination:
                 for chunk in uploaded_file.chunks():
                     destination.write(chunk)
@@ -99,7 +101,7 @@ def scan_document_pii(request):
             emit_progress(document_id, "file_verification", "error", 15, {"error": "Invalid file or path"})
             return Response(
                 {"error": "A valid PDF 'file' or existent 'file_path' must be provided."},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         emit_progress(document_id, "file_verification", "done", 25)
@@ -126,7 +128,7 @@ def scan_document_pii(request):
         audit_result = audit_contract_text(full_text)
         emit_progress(document_id, "clause_risk_analysis", "done", 95, {
             "risk_level": audit_result.get("risk_level", "Unknown"),
-            "compliance_score": audit_result.get("compliance_score", 0)
+            "compliance_score": audit_result.get("compliance_score", 0),
         })
 
         emit_progress(document_id, "completed", "done", 100)
@@ -135,7 +137,7 @@ def scan_document_pii(request):
             "status": "completed",
             "total_entities": total_pii,
             "audit": audit_result,
-            "pages": pages_result
+            "pages": pages_result,
         })
 
     except Exception as e:
@@ -149,47 +151,8 @@ def scan_document_pii(request):
             except OSError:
                 pass
 
-@api_view(['POST'])
-def document_chat(request, document_id):
-    query = request.data.get("query")
-    if not query or not query.strip():
-        return Response(
-            {"error": "Query string is required."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
 
-    try:
-        result = answer_document_query(str(document_id), query.strip())
-        return Response(result, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@api_view(['POST'])
-def document_ingest(request, document_id):
-    file_path = request.data.get("file_path")
-    if not file_path:
-        return Response(
-            {"error": "file_path is required."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    try:
-        chunks_count = ingest_document_chunks(str(document_id), file_path)
-        return Response(
-            {"message": "Ingestion successful", "chunks_stored": chunks_count},
-            status=status.HTTP_200_OK
-        )
-    except Exception as e:
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-@api_view(['POST'])
+@api_view(["POST"])
 def flatten_document_view(request):
     """
     Accepts multipart 'file' plus JSON strings for 'redactions', 'tabs', and 'certificate_data'.
@@ -224,11 +187,9 @@ def flatten_document_view(request):
             certificate_data=certificate_data,
         )
 
-        # Read output into memory so temp files can be cleaned up safely
         with open(out_path, "rb") as f:
             pdf_bytes = f.read()
 
-        from django.http import HttpResponse
         response = HttpResponse(pdf_bytes, content_type="application/pdf")
         response["Content-Disposition"] = f'attachment; filename="shielded_{uploaded_file.name}"'
         response["X-Original-SHA256"] = hashes["original_sha256"]
@@ -243,7 +204,8 @@ def flatten_document_view(request):
             if os.path.exists(p):
                 os.remove(p)
 
-@api_view(['POST'])
+
+@api_view(["POST"])
 def document_ingest(request, document_id):
     """
     Accepts either an uploaded multipart 'file' or a local 'file_path',
@@ -269,11 +231,11 @@ def document_ingest(request, document_id):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        total_chunks = ingest_document_chunks(document_id, target_path)
+        total_chunks = ingest_document_chunks(str(document_id), target_path)
         return Response(
             {
                 "status": "indexed",
-                "document_id": document_id,
+                "document_id": str(document_id),
                 "chunks_indexed": total_chunks,
             },
             status=status.HTTP_200_OK,
@@ -285,7 +247,7 @@ def document_ingest(request, document_id):
             os.remove(temp_path)
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 def document_chat(request, document_id):
     """
     Accepts { "question": "..." } (or { "query": "..." }), runs privacy-preserving
@@ -296,50 +258,9 @@ def document_chat(request, document_id):
         return Response({"error": "Field 'question' is required."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        result = answer_document_query(document_id, question)
+        result = answer_document_query(str(document_id), question)
         return Response(result, status=status.HTTP_200_OK)
     except ValueError as ve:
         return Response({"error": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class DocumentChatView(APIView):
-    def post(self, request, document_id):
-        query = request.data.get("query")
-        if not query or not query.strip():
-            return Response(
-                {"error": "Query string is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            result = answer_document_query(str(document_id), query.strip())
-            return Response(result, status=status.HTTP_200_OK)
-        except Exception as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-
-class DocumentIngestView(APIView):
-    def post(self, request, document_id):
-        file_path = request.data.get("file_path")
-        if not file_path:
-            return Response(
-                {"error": "file_path is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            chunks_count = ingest_document_chunks(str(document_id), file_path)
-            return Response(
-                {"message": "Ingestion successful", "chunks_stored": chunks_count},
-                status=status.HTTP_200_OK,
-            )
-        except Exception as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )

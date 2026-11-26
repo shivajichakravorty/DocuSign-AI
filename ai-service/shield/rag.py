@@ -9,7 +9,7 @@ from google import genai
 import pdfplumber
 from presidio_analyzer import AnalyzerEngine
 import psycopg2
-from ocr import ocr_pdf_page
+from shield.ocr import ocr_pdf_page
 
 load_dotenv()
 
