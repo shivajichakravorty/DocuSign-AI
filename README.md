@@ -1,101 +1,133 @@
 # 🛡️ DocuShield AI
 
-**DocuShield AI** is a privacy-first digital document signing, legal risk auditing, and zero-leakage contract intelligence platform. It combines a multi-party e-signature workflow with an AI security engine that detects Personally Identifiable Information (PII), flags hidden legal liabilities, enforces legal approval gates, enables PII-masked RAG document Q&A, and seals executed agreements with cryptographic SHA-256 integrity certificates.
+**Privacy-First Digital Document Signing, Automated Contract Risk Auditing & PII-Masked RAG Intelligence**
+
+DocuShield AI is a full-stack document execution and legal intelligence platform built around a **zero-leakage privacy architecture**. Before any contract text touches a vector database or external LLM API, sensitive PII is detected locally, spatially redacted and flattened into the PDF binary, and replaced with deterministic surrogate tokens (`<PERSON_1>`, `<EMAIL_ADDRESS_1>`) that re-hydrate exclusively on the user's client.
 
 ---
 
-## ✨ Key Features
+## ✨ Core Capabilities
 
-### 🔐 Authentication & Multi-Tenant Access
-- **Secure Session Lifecycle:** End-to-end user registration, login, and password reset flow powered by `bcryptjs` password hashing, signed JWT tokens, and HTTP-only session cookies.
-- **Tenant Isolation:** Protected client routes, custom `useAuth` hooks, and strict per-user document isolation at the API and database layers.
-- **Interactive Dashboard:** Real-time document status filtering, instant search, live metrics, and an in-app architecture & workflow documentation guide.
-
-### 📄 Interactive Signing & Envelope Workspace
-- **Streaming Document Ingestion:** High-throughput `@fastify/multipart` PDF uploads streamed directly to storage via `pipeline()` with MIME-type and size validation.
-- **Multi-Page PDF Canvas:** In-browser PDF rendering (`react-pdf` / `pdfjs-dist`) with zoom controls, page jump citations, and responsive percentage-based `(X, Y)` coordinate overlays.
-- **Draggable Field Placement:** Place, reposition, and synchronize `signature`, `initials`, `date`, and custom `text` fields across pages.
-- **Tokenized Guest Signing Portal:** Cryptographically secure 32-byte signing tokens (`/sign/:token`) allow external signers to complete fields (with auto-derived initials, date stamps, and text inputs) and execute agreements without creating an account.
-
-### 🛡️ AI Privacy, Risk Auditing & Zero-Leakage RAG (`ai-service`)
-- **Spatial PII Detection & Visual Shielding:** Powered by Microsoft Presidio, spaCy NER (`en_core_web_sm`), and `pdfplumber` to detect sensitive entities (SSNs, emails, names, phone numbers, URLs) and map them to normalized page bounding boxes `[x, y, w, h]` with a live **Shield View** toggle.
-- **Zero-Leakage Surrogate RAG Chat:** Indexes document pages into `pgvector` using local `FastEmbed` (`BAAI/bge-small-en-v1.5`) embeddings after replacing sensitive PII with reversible `<SURROGATE>` tokens—allowing `gemini-2.5-flash` to answer contract questions with clickable page citations without exposing raw PII to external LLM APIs.
-- **Contract Clause Risk Auditing & Redlining:** Automated legal risk inspection flagging missing limitation-of-liability clauses, broad indemnification traps, and one-sided terms—computing a dynamic Compliance Score (`0–100`) and risk tier (`Low`, `Medium`, `High`) alongside interactive clause redlining.
-- **Legal Approval Gatekeeper:** Blocks external signing invites on `High` risk or rejected agreements until Legal Counsel approves the redlines.
-- **Asynchronous Job Tracking:** Background audit processing via `BullMQ` + `Redis` with real-time progress streaming over WebSockets.
-
-### 🔒 Cryptographic Integrity & Hardened PDF Export
-- **SHA-256 Tamper Sealing & Audit Ledger:** Records pre-signing and post-signing SHA-256 document digests alongside an immutable signer telemetry ledger (IP address, user agent, UTC timestamps, and per-tab SHA-256 signature checksums) verifiable inside the **Audit Seal** modal.
-- **Binary Stream Redaction & Flattening (`PyMuPDF`):** Scrubs masked PII characters directly from the underlying PDF content stream, permanently burns placed signatures onto pages, and appends a cryptographic **Certificate of Completion** page for both **Redacted PDF** and **Executed PDF** exports.
+- **Spatial PII Redaction & Binary Flattening (`Shield View`):** Uses Microsoft Presidio + spaCy NLP to locate sensitive entities with bounding-box coordinates and permanently flattens redactions into the PDF via PyMuPDF (`fitz`), preventing copy-paste or metadata recovery.
+- **Zero-Leakage Hybrid RAG Document Chat:**
+  - Extracts selectable text via `pdfplumber` with automatic **Tesseract OCR fallback** for scanned PDFs.
+  - Masks PII into reversible surrogate tokens prior to embedding and LLM inference.
+  - Combines **384-dim local embeddings** (`BAAI/bge-small-en-v1.5` via FastEmbed) in PostgreSQL `pgvector` (75% cosine similarity) with PostgreSQL full-text search (`ts_rank_cd`, 25%) for accurate, page-cited answers.
+- **Automated Clause Risk Auditing & Redline Generation:** Hybrid deterministic regex rules + **Gemini 3.8 Flash** legal remediation engine flag uncapped liability, broad indemnification, unilateral termination, and IP overreach—generating balanced fallback clauses and a live `0–100` compliance score.
+- **Cryptographic Signature Audit Trail:** Interactive signature/initial/date field placement with **SHA-256 tamper-sealing** and JWT-authenticated multi-party signing workflows.
+- **Production-Grade Resilience:** Asynchronous background audit queues (`Redis` + `BullMQ`), real-time UI progress tracking, bounded exponential backoff with jitter for transient upstream `503`/`429` spikes, and graceful quota fallback.
 
 ---
 
 ## 🏗️ System Architecture
 
+DocuShield AI runs as a 5-container microservices stack orchestrated via Docker Compose:
+
 ```text
-┌──────────────────────────────────────────────────────────┐
-│              React + Vite Frontend (TypeScript)          │
-│  • Split-Pane PDF Viewer & Bounding-Box Shield Overlays  │
-│  • Draggable Signature Tabs & Guest Signing Portal       │
-│  • AI Risk Drawer, Clause Redliner & Zero-Leakage Chat   │
-│  • Cryptographic Audit Seal & Tamper Verification Modal  │
-└─────────────────────────────┬────────────────────────────┘
-                              │ REST / WebSockets
-┌─────────────────────────────▼────────────────────────────┐
-│             Fastify Edge Gateway (Node.js)               │
-│  • JWT Auth, Password Reset & Legal Approval Gate        │
-│  • Streaming Multipart Uploads & Hardened PDF Exports    │
-│  • Cryptographic Signing Ledger & SHA-256 Verification   │
-│  • BullMQ + Redis Async Job Dispatcher & WS Pub/Sub      │
-└──────────────┬────────────────────────────┬──────────────┘
-               │                            │ HTTP / Multipart
-┌──────────────▼──────────────┐  ┌──────────▼──────────────┐
-│   PostgreSQL + pgvector     │  │   Django AI Service     │
-│  • Users, Docs & Signers    │  │  • Presidio + spaCy NER │
-│  • Signature Tabs & Clauses │  │  • FastEmbed + Hybrid   │
-│  • Vector Chunks (384-dim)  │  │    pgvector RAG Search  │
-│  • Redactions & Audit Logs  │  │  • Gemini 2.5 Flash QA  │
-│  • SHA-256 Seals & Certs    │  │  • PyMuPDF Flattener    │
-└─────────────────────────────┘  └─────────────────────────┘
+┌─────────────────────────┐      REST / JWT      ┌─────────────────────────┐
+│  docushield-frontend    │ ───────────────────▶ │   docushield-backend    │
+│  React • TS • Vite      │                      │  Node.js • Fastify • TS │
+│  Tailwind CSS           │ ◀─────────────────── │  SHA-256 • BullMQ       │
+└─────────────────────────┘   Live Scan Status   └───────────┬─────────────┘
+                                                             │
+                                     ┌───────────────────────┼───────────────────────┐
+                                     ▼                       ▼                       ▼
+                       ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
+                       │   docushield-redis    │ │    docushield-db      │ │    docushield-ai      │
+                       │   BullMQ Job Queue    │ │  PostgreSQL 16        │ │  Python • Django      │
+                       │                       │ │  pgvector + FTS       │ │  Presidio • PyMuPDF   │
+                       └───────────────────────┘ └───────────────────────┘ │  FastEmbed • Gemini   │
+                                                                           └───────────────────────┘
+```
 
-🛠️ Tech Stack
-Frontend: React 19, TypeScript, Vite, Tailwind CSS, react-pdf, Lucide Icons, Axios
-API Gateway: Node.js, Fastify, @fastify/jwt, @fastify/cookie, @fastify/multipart, @fastify/websocket, BullMQ, Redis
-AI & PDF Microservice: Python 3.11+, Django, Django REST Framework, Microsoft Presidio, spaCy, FastEmbed (BAAI/bge-small-en-v1.5), Google Gemini (gemini-2.5-flash), pdfplumber, PyMuPDF (fitz)
-Database: PostgreSQL (pgvector, uuid-ossp, pgcrypto, relational schemas & JSONB audit trails)
+| Service | Container | Stack | Responsibility |
+| :--- | :--- | :--- | :--- |
+| **Frontend** | `docushield-frontend` | React, TypeScript, Vite, Tailwind CSS | Document dashboard, interactive PDF field placement, Shield View redaction toggles, and cited RAG chat |
+| **Edge Gateway** | `docushield-backend` | Node.js, Fastify, TypeScript | Authentication (JWT), file uploads, SHA-256 document hashing, audit trails, and BullMQ job dispatch |
+| **AI Microservice** | `docushield-ai` | Python 3.12, Django, Presidio, PyMuPDF, FastEmbed, Google GenAI | Spatial PII redaction, OCR fallback, local vector embeddings, hybrid search, and Gemini clause remediation |
+| **Database** | `docushield-db` | PostgreSQL 16 + `pgvector` | Relational document/audit state, 384-dim vector storage, GIN full-text index, and local surrogate maps |
+| **Queue Broker** | `docushield-redis` | Redis | Asynchronous background audit & ingestion job orchestration |
 
-docushield-ai/
-├── frontend/                   # React + Vite + TypeScript Client
-│   └── src/
-│       ├── api/                # Axios client with auth interceptors
-│       ├── components/         # Layout, Dashboard, ClauseRedlineManager, AuditCertificateModal, DocumentationModal
-│       ├── context/            # AuthContext session state
-│       ├── pages/              # Login, Register, ForgotPassword, ResetPassword, Dashboard, DocumentWorkspace, PublicSigningPortal
-│       └── types/              # Strict TypeScript interfaces
-│
-├── backend/                    # Fastify + TypeScript Edge Gateway
-│   ├── uploads/                # Local PDF storage
-│   └── src/
-│       ├── plugins/            # JWT & cookie auth decorators
-│       ├── queues/             # BullMQ audit queue & worker
-│       ├── routes/             # auth, document, approval, signing, and RAG proxy routes
-│       ├── services/           # SHA-256 file hashing & signature checksum utilities
-│       ├── db.ts               # PostgreSQL connection pool
-│       └── server.ts           # Fastify server entrypoint
-│
-└── ai-service/                 # Python + Django AI & Security Microservice
-    ├── config/                 # Django settings & URL routing
-    └── shield/
-        ├── extractor.py        # pdfplumber + Presidio spatial PII bounding-box extractor
-        ├── auditor.py          # Contract clause risk evaluator & compliance scoring
-        ├── rag.py              # Zero-Leakage Surrogate PII sanitizer, FastEmbed indexer & Gemini 2.5 RAG
-        ├── flattener.py        # PyMuPDF binary redaction, signature burning & certificate builder
-        └── views.py            # DRF API endpoints (/scan-document/, /flatten-document/, /ingest/, /chat/)
+---
 
-🗺️ Roadmap
-[x] Phase 1: JWT authentication, password reset flow, session persistence, and dark-mode dashboard UI
-[x] Phase 2: Streaming PDF uploads, multi-page viewer, draggable signature tabs, and tokenized guest signing
-[x] Phase 3: Django AI service with Presidio spatial PII redaction, clause risk auditing, and live WebSocket progress
-[x] Phase 4A: Legal approval gatekeeper, clause redlining, SHA-256 tamper-sealing, and hardened PyMuPDF binary PDF/certificate export
-[x] Phase 4B: Zero-Leakage Document Chat (pgvector hybrid search + reversible <SURROGATE> PII masking + page citations)
-[ ] Phase 5: Automated test suite (Pytest / Playwright), S3/R2 object storage, and Docker Compose deployment
+## 🚀 Quickstart (Docker Compose)
+
+### Prerequisites
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (with Docker Compose v2)
+- A Google AI Studio API key (`GEMINI_API_KEY`)
+
+### 1. Clone & Configure Environment
+```bash
+git clone [https://github.com/shivajichakravorty/DocuSign-AI.git](https://github.com/shivajichakravorty/DocuShield-AI.git)
+cd DocuShield-AI
+cp .env.example .env
+```
+
+Update `.env` with your credentials:
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+JWT_SECRET=your_super_secret_jwt_key
+DB_NAME=docushield
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_HOST=docushield-db
+DB_PORT=5432
+```
+
+### 2. Build & Launch All 5 Containers
+```bash
+docker compose up -d --build
+```
+
+Verify all services are healthy:
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
+
+- **Frontend Workspace:** `http://localhost:5173`
+- **Backend API Gateway:** `http://localhost:3000`
+- **AI Microservice:** `http://localhost:8000`
+
+---
+
+## 🧪 Automated Test Suite
+
+DocuShield AI is verified across all three layers of the testing pyramid:
+
+### 1. AI & Privacy Unit Tests (`pytest`)
+Tests Presidio surrogate PII masking, re-hydration integrity, and contract clause risk detection:
+```bash
+cd ai-service
+source venv/bin/activate
+pytest
+```
+
+### 2. Backend Security & Integrity Tests (`Vitest`)
+Tests SHA-256 document tamper-detection hashing and JWT verification:
+```bash
+cd backend
+npm test
+```
+
+### 3. End-to-End Browser Tests (`Playwright`)
+Tests unauthenticated route protection, login flows, and live dashboard workspace rendering against the running stack:
+```bash
+cd frontend
+npx playwright test --config=playwright.config.ts
+```
+
+---
+
+## 🔐 Privacy & Security Design Decisions
+
+- **No Raw PII Sent to External LLMs:** All names, emails, phone numbers, and identifiers are substituted with deterministic tokens (`<PERSON_1>`) in PostgreSQL before prompts are constructed.
+- **Local Embedding Generation:** Document chunks are embedded inside `docushield-ai` using `BAAI/bge-small-en-v1.5` so raw contract text never leaves your infrastructure during indexing.
+- **Tamper-Evident Execution:** Finalized documents are hashed with SHA-256 and recorded in an immutable execution audit trail.
+
+---
+
+## 👤 Author
+
+**Shivaji Chakravorty**  
+- GitHub: [@shivajichakravorty](https://github.com/shivajichakravorty)  
+- LinkedIn: [Shivaji Chakravorty](https://www.linkedin.com/in/shivaji-chakravorty-585945372/)
