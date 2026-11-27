@@ -1,14 +1,19 @@
 import os
 import re
 import json
+import time
+import random
 from typing import List, Dict, Any
 from django.conf import settings
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 
 # Initialize Gemini API Client
 GEMINI_API_KEY = getattr(settings, "GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+GEMINI_MODEL = "gemini-3.8-flash"
 
 CLAUSE_RULES = [
     {
@@ -63,6 +68,27 @@ CLAUSE_RULES = [
     }
 ]
 
+
+def _generate_with_retry(prompt: str, max_attempts: int = 3, base_delay: float = 1.0):
+    """Calls Gemini with bounded exponential backoff + jitter for transient 503/429 errors."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+        except APIError as e:
+            is_transient = getattr(e, "code", None) in (429, 503) or "503" in str(e) or "UNAVAILABLE" in str(e)
+            if not is_transient or attempt == max_attempts:
+                raise
+            sleep_seconds = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            print(f"[Gemini Retry {attempt}/{max_attempts}] Transient error ({e}); retrying in {sleep_seconds:.2f}s...")
+            time.sleep(sleep_seconds)
+
+
 def generate_ai_remediations(full_text: str, detected_flags: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Uses Gemini to identify verbatim clause boundaries and write balanced redline remediations."""
     if not detected_flags:
@@ -97,13 +123,7 @@ Contract Text:
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
+        response = _generate_with_retry(prompt)
         data = json.loads(response.text)
         return data.get("clauses", [])
     except Exception as e:
@@ -120,6 +140,7 @@ Contract Text:
             }
             for f in detected_flags
         ]
+
 
 def audit_contract_text(full_text: str) -> Dict[str, Any]:
     text_lower = full_text.lower()

@@ -1,11 +1,14 @@
 import getpass
 import json
 import os
+import random
 import re
+import time
 
 from dotenv import load_dotenv
 from fastembed import TextEmbedding
 from google import genai
+from google.genai.errors import APIError
 import pdfplumber
 from presidio_analyzer import AnalyzerEngine
 import psycopg2
@@ -18,6 +21,8 @@ DB_USER = os.getenv("DB_USER", getpass.getuser())
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
+
+GEMINI_MODEL = "gemini-3.8-flash"
 
 # Local 384-dim embedding model (~67MB, runs 100% locally)
 embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
@@ -177,6 +182,7 @@ def ingest_document_chunks(document_id: str, file_path: str) -> int:
     conn.close()
     return total_chunks
 
+
 def _get_document_token_map(document_id: str) -> dict:
     conn = get_db_connection()
     cur = conn.cursor()
@@ -232,9 +238,30 @@ def search_document_chunks(document_id: str, query_text: str, top_k: int = 4):
     return results
 
 
+def _generate_with_retry(client: genai.Client, prompt: str, max_attempts: int = 3, base_delay: float = 1.0):
+    """Calls Gemini with bounded exponential backoff + jitter for transient 503/429 spikes."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+        except APIError as e:
+            err_str = str(e)
+            # Daily quota limits won't clear in seconds — fail immediately instead of sleeping
+            if "GenerateRequestsPerDay" in err_str or "PerDay" in err_str:
+                raise
+            is_transient = getattr(e, "code", None) in (429, 503) or "503" in err_str or "UNAVAILABLE" in err_str
+            if not is_transient or attempt == max_attempts:
+                raise
+            sleep_seconds = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            print(f"[Gemini RAG Retry {attempt}/{max_attempts}] Transient error ({e}); retrying in {sleep_seconds:.2f}s...")
+            time.sleep(sleep_seconds)
+
+
 def answer_document_query(document_id: str, query_text: str, api_key: str = None):
     """
-    Retrieves top sanitized chunks via hybrid search, queries Gemini 2.5 Flash using
+    Retrieves top sanitized chunks via hybrid search, queries Gemini 3.8 Flash using
     only masked surrogate text, and re-hydrates real entities locally for the user.
     """
     gemini_key = api_key or os.getenv("GEMINI_API_KEY")
@@ -284,12 +311,21 @@ Document Excerpts:
 
 User Question: {sanitized_query}"""
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-    )
-
-    final_answer = rehydrate_text(response.text or "", token_map)
+    try:
+        response = _generate_with_retry(client, prompt)
+        final_answer = rehydrate_text(response.text or "", token_map)
+    except APIError as e:
+        err_str = str(e)
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            final_answer = (
+                "Gemini API free-tier rate or daily quota is temporarily exhausted. "
+                "Here are the most relevant sections retrieved directly from your document—please retry your question shortly."
+            )
+        else:
+            final_answer = (
+                "The AI service is temporarily overloaded (503). "
+                "Here are the most relevant sections retrieved from your document—please try again in a moment."
+            )
 
     return {
         "answer": final_answer,
